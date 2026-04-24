@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Epipolar Geometry Demo</title>
+  <style>
+    :root {
+      --bg: #f7f4ee;
+      --ink: #1d1d1f;
+      --muted: #6f6a63;
+      --plane: #ffffff;
+      --epi: #d8d2c7;
+      --line: #4a88ff;
+      --point: #ff5f2e;
+      --base: #e5a100;
+      --accent: #0f766e;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: radial-gradient(circle at top, #fffdf8, var(--bg) 60%);
+      color: var(--ink);
+    }
+    .wrap {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+    h1 {
+      margin: 0 0 10px;
+      font-size: 28px;
+    }
+    p {
+      margin: 0 0 12px;
+      color: var(--muted);
+      line-height: 1.6;
+    }
+    .panel {
+      margin-top: 18px;
+      background: rgba(255,255,255,0.68);
+      border: 1px solid #e8e0d0;
+      border-radius: 18px;
+      padding: 16px;
+      box-shadow: 0 20px 50px rgba(103, 84, 49, 0.08);
+      backdrop-filter: blur(8px);
+    }
+    svg {
+      width: 100%;
+      height: auto;
+      display: block;
+    }
+    .controls {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+      margin-top: 12px;
+    }
+    button {
+      border: 0;
+      border-radius: 999px;
+      padding: 10px 16px;
+      background: var(--accent);
+      color: #fff;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    input[type="range"] {
+      width: min(420px, 100%);
+    }
+    .readout {
+      font-size: 14px;
+      color: var(--muted);
+    }
+    .legend {
+      display: flex;
+      gap: 14px;
+      flex-wrap: wrap;
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+    .swatch {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      margin-right: 6px;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>对极几何动画演示</h1>
+    <p>固定左图像点 <strong>p</strong>，让空间点 <strong>P</strong> 沿着左相机的同一条视线前后移动。你会看到右图对应点 <strong>p'</strong> 虽然位置变化，但始终被限制在同一条对极线 <strong>l'</strong> 上。</p>
+    <p>这正是“对极几何只把二维搜索压缩到一维搜索”的含义。</p>
+
+    <div class="panel">
+      <svg viewBox="0 0 1100 680" aria-label="epipolar geometry animation">
+        <defs>
+          <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#1d1d1f"></path>
+          </marker>
+        </defs>
+
+        <line id="baseline" x1="130" y1="560" x2="965" y2="560" stroke="var(--base)" stroke-width="5" />
+        <polygon id="epiPlane" points="375,310 700,330 965,560 130,560" fill="var(--epi)" opacity="0.8" />
+
+        <polygon id="leftPlane" points="150,360 445,400 445,585 150,545" fill="var(--plane)" stroke="#222" stroke-width="4" />
+        <polygon id="rightPlane" points="590,410 920,335 920,535 590,610" fill="var(--plane)" stroke="#222" stroke-width="4" />
+
+        <line id="leftEpiLine" x1="150" y1="545" x2="445" y2="585" stroke="var(--line)" stroke-width="6" opacity="0.95" />
+        <line id="rightEpiLine" x1="590" y1="610" x2="920" y2="535" stroke="var(--line)" stroke-width="6" opacity="0.95" />
+
+        <circle cx="130" cy="560" r="8" fill="#dfe7eb" stroke="#222" stroke-width="3" />
+        <circle cx="965" cy="560" r="8" fill="#dfe7eb" stroke="#222" stroke-width="3" />
+        <text x="105" y="605" font-size="30">O₁</text>
+        <text x="940" y="605" font-size="30">O₂</text>
+
+        <circle id="eLeft" cx="382.5" cy="576.5" r="10" fill="var(--point)" stroke="#222" stroke-width="3" />
+        <circle id="eRight" cx="667" cy="592.5" r="10" fill="var(--point)" stroke="#222" stroke-width="3" />
+        <text x="394" y="568" font-size="28">e</text>
+        <text x="680" y="586" font-size="28">e′</text>
+
+        <circle id="pLeft" cx="295" cy="430" r="10" fill="var(--point)" stroke="#222" stroke-width="3" />
+        <text x="275" y="400" font-size="28">p</text>
+
+        <line x1="130" y1="560" x2="295" y2="430" stroke="#222" stroke-width="4" />
+        <line id="rayLeft" x1="130" y1="560" x2="510" y2="190" stroke="#222" stroke-width="4" marker-end="url(#arrow)" />
+
+        <line id="ray1" x1="130" y1="560" x2="560" y2="220" stroke="#222" stroke-width="4" />
+        <line id="ray2" x1="965" y1="560" x2="560" y2="220" stroke="#222" stroke-width="4" />
+        <line id="rayRightToPPrime" x1="965" y1="560" x2="774" y2="493" stroke="#222" stroke-width="4" />
+
+        <circle id="pointP" cx="560" cy="220" r="14" fill="var(--point)" stroke="#222" stroke-width="4" />
+        <text id="labelP" x="548" y="185" font-size="34">P</text>
+
+        <circle id="pRight" cx="774" cy="493" r="10" fill="var(--point)" stroke="#222" stroke-width="3" />
+        <text id="labelPRight" x="786" y="474" font-size="28">p′</text>
+
+        <text x="450" y="330" font-size="30" fill="#7f5ab6">对极平面</text>
+        <text x="235" y="510" font-size="28" fill="var(--line)">左图像点固定</text>
+        <text x="706" y="520" font-size="28" fill="var(--line)">p′ 只在线上滑动</text>
+        <text x="474" y="592" font-size="28" fill="var(--base)">baseline</text>
+
+        <line id="traceLine" x1="690" y1="587" x2="823" y2="557" stroke="var(--line)" stroke-dasharray="10 10" stroke-width="3" opacity="0.7" />
+      </svg>
+
+      <div class="controls">
+        <button id="toggle">暂停</button>
+        <input id="depth" type="range" min="0" max="1000" value="500" />
+        <div class="readout" id="readout">深度位置 t = 0.500</div>
+      </div>
+
+      <div class="legend">
+        <span><span class="swatch" style="background:#ff5f2e"></span>点：空间点 P、像点 p / p′、对极点 e / e′</span>
+        <span><span class="swatch" style="background:#4a88ff"></span>蓝线：对极线</span>
+        <span><span class="swatch" style="background:#e5a100"></span>黄线：baseline</span>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const state = {
+      playing: true,
+      t: 0.5,
+      dir: 1
+    };
+
+    const els = {
+      pointP: document.getElementById('pointP'),
+      labelP: document.getElementById('labelP'),
+      ray1: document.getElementById('ray1'),
+      ray2: document.getElementById('ray2'),
+      rayLeft: document.getElementById('rayLeft'),
+      rayRightToPPrime: document.getElementById('rayRightToPPrime'),
+      pRight: document.getElementById('pRight'),
+      labelPRight: document.getElementById('labelPRight'),
+      toggle: document.getElementById('toggle'),
+      depth: document.getElementById('depth'),
+      readout: document.getElementById('readout')
+    };
+
+    function lerp(a, b, t) {
+      return a + (b - a) * t;
+    }
+
+    function updateScene() {
+      const t = state.t;
+
+      const p3x = lerp(470, 640, t);
+      const p3y = lerp(290, 150, t);
+      const p2x = lerp(684, 845, t);
+      const p2y = lerp(589, 553, t);
+
+      els.pointP.setAttribute('cx', p3x);
+      els.pointP.setAttribute('cy', p3y);
+      els.labelP.setAttribute('x', p3x - 12);
+      els.labelP.setAttribute('y', p3y - 34);
+
+      els.ray1.setAttribute('x2', p3x);
+      els.ray1.setAttribute('y2', p3y);
+      els.ray2.setAttribute('x2', p3x);
+      els.ray2.setAttribute('y2', p3y);
+      els.rayLeft.setAttribute('x2', p3x - 55);
+      els.rayLeft.setAttribute('y2', p3y - 40);
+
+      els.pRight.setAttribute('cx', p2x);
+      els.pRight.setAttribute('cy', p2y);
+      els.labelPRight.setAttribute('x', p2x + 12);
+      els.labelPRight.setAttribute('y', p2y - 18);
+
+      els.rayRightToPPrime.setAttribute('x2', p2x);
+      els.rayRightToPPrime.setAttribute('y2', p2y);
+
+      els.depth.value = Math.round(t * 1000);
+      els.readout.textContent = `深度位置 t = ${t.toFixed(3)}，P 前后移动时，p′ 仍在同一条对极线上`;
+    }
+
+    function tick() {
+      if (state.playing) {
+        state.t += 0.0028 * state.dir;
+        if (state.t >= 1) {
+          state.t = 1;
+          state.dir = -1;
+        }
+        if (state.t <= 0) {
+          state.t = 0;
+          state.dir = 1;
+        }
+        updateScene();
+      }
+      requestAnimationFrame(tick);
+    }
+
+    els.toggle.addEventListener('click', () => {
+      state.playing = !state.playing;
+      els.toggle.textContent = state.playing ? '暂停' : '播放';
+    });
+
+    els.depth.addEventListener('input', (e) => {
+      state.t = Number(e.target.value) / 1000;
+      updateScene();
+    });
+
+    updateScene();
+    requestAnimationFrame(tick);
+  </script>
+</body>
+</html>
