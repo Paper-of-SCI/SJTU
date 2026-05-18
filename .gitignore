@@ -1,3 +1,11 @@
 src/datasets/
 !src/datasets/
 !src/datasets/readme.md
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local training/evaluation outputs
+outputs/

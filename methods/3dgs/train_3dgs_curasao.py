@@ -46,6 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-every", type=int, default=50, help="Console log interval.")
     parser.add_argument("--eval-every", type=int, default=500, help="Evaluate held-out test views every N iterations; set 0 to disable.")
     parser.add_argument("--seed", type=int, default=0, help="Random seed.")
+    parser.add_argument("--densify-grad-threshold", type=float, default=2.0e-5, help="Screen-space gradient threshold for clone/split.")
     parser.add_argument("--disable-densification", action="store_true", help="Turn off clone/split/prune.")
     return parser.parse_args()
 
@@ -86,7 +87,7 @@ def main() -> None:
             start_step=500,
             stop_step=max(args.iterations - 500, 501),
             interval=100,
-            grad_threshold=2.0e-4,
+            grad_threshold=args.densify_grad_threshold,
             scene_extent=float(scene.scene_extent),
             percent_dense=0.01,
             min_opacity=0.005,
@@ -105,7 +106,10 @@ def main() -> None:
         f"数据划分：训练={len(train_cameras)} 张，测试={len(test_cameras)} 张，"
         f"holdout={args.holdout}，分辨率={scene.width}x{scene.height}，降采样 factor={args.factor}"
     )
-    print(f"初始 Gaussian 数量：{model.num_gaussians}，训练步数：{args.iterations}，启用致密化：{not args.disable_densification}")
+    print(
+        f"初始 Gaussian 数量：{model.num_gaussians}，训练步数：{args.iterations}，"
+        f"启用致密化：{not args.disable_densification}，densify_grad_threshold={args.densify_grad_threshold:g}"
+    )
     print(f"输出目录：{out_dir}")
 
     started_at = time.perf_counter()
@@ -132,7 +136,14 @@ def main() -> None:
                     render.image.detach().clamp(0.0, 1.0).permute(1, 2, 0).cpu().numpy(),
                     camera.image.detach().permute(1, 2, 0).cpu().numpy(),
                 )
-            densify_text = "" if stats is None else f" clone={stats.cloned} split={stats.split} prune={stats.pruned} total={stats.total}"
+            densify_text = ""
+            if stats is not None and stats.densified:
+                densify_text = (
+                    f" clone={stats.cloned} split={stats.split} prune={stats.pruned} total={stats.total}"
+                    f" high_grad={stats.high_grad} grad_max={stats.grad_max:.2e}"
+                )
+            if stats is not None and stats.opacity_reset:
+                densify_text += " opacity_reset=1"
             progress.set_postfix(
                 {
                     "loss": f"{float(loss.detach()):.4f}",

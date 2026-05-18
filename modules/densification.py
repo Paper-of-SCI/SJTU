@@ -23,6 +23,10 @@ class DensificationStats:
     pruned: int = 0
     opacity_reset: bool = False
     total: int = 0
+    densified: bool = False
+    high_grad: int = 0
+    grad_mean: float = 0.0
+    grad_max: float = 0.0
 
 
 @dataclass
@@ -82,6 +86,10 @@ class DensificationController:
 
         avg_grad = model.gradient_accum / model.gradient_count.clamp_min(1.0)
         high_grad = avg_grad >= self.config.grad_threshold
+        seen = model.gradient_count > 0
+        seen_grad = avg_grad[seen]
+        grad_mean = float(seen_grad.mean().item()) if seen_grad.numel() > 0 else 0.0
+        grad_max = float(seen_grad.max().item()) if seen_grad.numel() > 0 else 0.0
         max_scale = model.scales.detach().max(dim=-1).values
         dense_threshold = self.config.scene_extent * self.config.percent_dense
         clone_mask = high_grad & (max_scale <= dense_threshold)
@@ -122,7 +130,16 @@ class DensificationController:
             _patch_optimizer_prune(model, optimizer, old, keep)
 
         model.clear_gradient_stats()
-        return DensificationStats(cloned=cloned, split=split, pruned=pruned, total=model.num_gaussians)
+        return DensificationStats(
+            cloned=cloned,
+            split=split,
+            pruned=pruned,
+            total=model.num_gaussians,
+            densified=True,
+            high_grad=int(high_grad.sum().item()),
+            grad_mean=grad_mean,
+            grad_max=grad_max,
+        )
 
 
 def _visibility_from_output(output: RenderOutput, count: int) -> Optional[Tensor]:

@@ -163,6 +163,14 @@ optimizer.step()
 set_group_lr(optimizer, "means", position_lr(step))
 ```
 
+常用参数含义：
+
+- `--iterations`: 训练总步数。
+- `--factor`: 图像降采样倍数；越大越省显存，但细节越少。
+- `--save-every`: 每隔多少步保存一次预览图和 PLY checkpoint。
+- `--log-every`: 每隔多少步打印一次训练状态。
+- `--densify-grad-threshold`: clone/split 的屏幕空间梯度阈值；如果日志里长期只有 `prune`、`clone/split` 一直为 0，说明阈值可能偏高，可以适当降低。
+
 ## 7. 自适应致密化 densification
 
 使用：
@@ -265,6 +273,7 @@ python methods/3dgs/train_3dgs_curasao.py \
   --out outputs/curasao_3dgs \
   --iterations 7000 \
   --factor 4 \
+  --densify-grad-threshold 2e-5 \
   --save-every 1000 \
   --log-every 50
 ```
