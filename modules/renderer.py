@@ -1,180 +1,107 @@
-"""可微分高斯光栅化器，封装 diff-gaussian-rasterization 后端。
-
-职责：
-    1. 用 SH 计算视角相关颜色
-    2. 计算 3D 协方差
-    3. 调用 CUDA 光栅化并返回 RenderOutput
-
-RenderOutput.screenspace_means 保留梯度，供 DensificationController 读取。
-"""
+"""Thin gsplat renderer wrapper."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, TYPE_CHECKING
+from typing import Any, Dict, Literal, Optional
 
 import torch
 from torch import Tensor
 
-from modules.gaussian_model import GaussianModel
 from modules.camera import Camera
-from modules.spherical_harmonics import eval_sh, get_view_directions
+from modules.gaussian_model import GaussianModel
 
-if TYPE_CHECKING:
-    pass
+RenderMode = Literal["RGB", "D", "ED", "RGB+D", "RGB+ED", "d", "Ed", "RGB-d", "RGB-Ed"]
 
 
 @dataclass
 class RenderOutput:
-    """一次渲染的输出结果。
+    """Renderer result in CHW-friendly form for external training code."""
 
-    Attributes:
-        image: (3, H, W) 渲染 RGB 图像，float32 [0,1]。
-        alpha: (1, H, W) 累积不透明度图。
-        depth: (1, H, W) 深度图（若后端支持），否则为 None。
-        radii: (N,) 每个高斯的 2D 投影半径（整数），不可见高斯为 0。
-        visibility_filter: (N,) bool，True 表示在本帧有非零半径。
-        screenspace_means: (N, 2) 屏幕空间 2D 均值，保留梯度供致密化使用。
-    """
     image: Tensor
     alpha: Tensor
     depth: Optional[Tensor]
-    radii: Tensor
-    visibility_filter: Tensor
-    screenspace_means: Tensor
+    radii: Optional[Tensor]
+    means2d: Optional[Tensor]
+    metadata: Dict[str, Any]
 
 
 class GaussianRenderer:
-    """3DGS 可微分渲染器。
-
-    封装 diff-gaussian-rasterization，提供统一的 render 接口。
-    本类无可学习参数，是纯粹的无状态函数对象。
-
-    Args:
-        sh_degree: 最大 SH 阶数（运行时可用 sh_degree_override 覆盖）。
-        bg_color: (3,) 背景颜色，默认白色 [1,1,1]。
-        scale_modifier: 全局尺度缩放因子（调试用，默认 1.0）。
-        antialiased: 是否启用抗锯齿（需要 diff-gaussian-rasterization 支持）。
-
-    Usage::
-
-        renderer = GaussianRenderer(sh_degree=3)
-        output = renderer.render(gaussians, camera)
-        loss = photometric_loss(output.image, camera.image)
-        loss.backward()
-        # output.screenspace_means.grad 可在此后读取
-    """
+    """Single-call wrapper around ``gsplat.rasterization``."""
 
     def __init__(
         self,
-        sh_degree: int = 3,
-        bg_color: Optional[Tensor] = None,
-        scale_modifier: float = 1.0,
-        antialiased: bool = False,
+        background: tuple[float, float, float] | Tensor = (1.0, 1.0, 1.0),
+        packed: bool = True,
+        sparse_grad: bool = False,
+        absgrad: bool = True,
+        rasterize_mode: Literal["classic", "antialiased"] = "classic",
+        radius_clip: float = 0.0,
+        eps2d: float = 0.3,
     ) -> None:
-        self.sh_degree = sh_degree
-        self.bg_color = bg_color if bg_color is not None else torch.ones(3)
-        self.scale_modifier = scale_modifier
-        self.antialiased = antialiased
+        self.background = background
+        self.packed = packed
+        self.sparse_grad = sparse_grad
+        self.absgrad = absgrad
+        self.rasterize_mode = rasterize_mode
+        self.radius_clip = radius_clip
+        self.eps2d = eps2d
 
     def render(
         self,
-        gaussians: GaussianModel,
+        model: GaussianModel,
         camera: Camera,
-        sh_degree_override: Optional[int] = None,
+        sh_degree: Optional[int] = None,
+        render_mode: RenderMode = "RGB",
     ) -> RenderOutput:
-        """执行一次完整的高斯光栅化渲染。
-
-        Args:
-            gaussians: GaussianModel，含当前场景参数。
-            camera: Camera，含相机内参、外参和图像分辨率。
-            sh_degree_override: 若指定，覆盖 self.sh_degree（用于 SH 渐进训练）。
-
-        Returns:
-            RenderOutput。
-        """
+        """Render one camera from one GaussianModel."""
         try:
-            from diff_gaussian_rasterization import (
-                GaussianRasterizationSettings,
-                GaussianRasterizer,
-            )
-        except ImportError:
-            raise ImportError(
-                "缺少 diff-gaussian-rasterization 包，请参考 README 安装：\n"
-                "  pip install git+https://github.com/graphdeco-inria/diff-gaussian-rasterization"
-            )
+            from gsplat import rasterization
+        except ImportError as exc:
+            raise ImportError("缺少 gsplat，请先安装与当前 PyTorch/CUDA 匹配的 gsplat。") from exc
 
-        degree = sh_degree_override if sh_degree_override is not None else self.sh_degree
-        degree = min(degree, gaussians.max_sh_degree)
-
-        device = gaussians.means.device
-        bg = self.bg_color.to(device)
-
-        # 屏幕空间均值（保留梯度，供致密化梯度统计使用）
-        screenspace_means = torch.zeros_like(
-            gaussians.means, requires_grad=True
-        )
-        try:
-            screenspace_means.retain_grad()
-        except Exception:
-            pass
-
-        # 视角相关颜色（SH 求值）
-        view_dirs = get_view_directions(gaussians.means, camera.camera_center)  # (N, 3)
-        sh_coeffs = gaussians.sh_coefficients[:, :num_sh_coefficients(degree), :]  # (N, K, 3)
-        colors = eval_sh(degree, sh_coeffs, view_dirs)   # (N, 3)
-        colors = colors + 0.5   # 偏移，使 DC SH 对应 0.5 灰度
-        colors = colors.clamp(min=0.0)
-
-        # 光栅化设置
-        raster_settings = GaussianRasterizationSettings(
-            image_height=camera.height,
-            image_width=camera.width,
-            tanfovx=_fov_to_tan(camera.fov_x),
-            tanfovy=_fov_to_tan(camera.fov_y),
-            bg=bg,
-            scale_modifier=self.scale_modifier,
-            viewmatrix=camera.w2c.float(),
-            projmatrix=camera.full_projection_matrix.float(),
+        tensors = model.activated_tensors()
+        degree = model.sh_degree if sh_degree is None else min(int(sh_degree), model.sh_degree)
+        background = _background_tensor(self.background, camera.device)
+        colors, alphas, meta = rasterization(
+            means=tensors.means,
+            quats=tensors.quats,
+            scales=tensors.scales,
+            opacities=tensors.opacities,
+            colors=tensors.colors,
+            viewmats=camera.viewmat[None, ...],
+            Ks=camera.K[None, ...],
+            width=camera.width,
+            height=camera.height,
+            near_plane=camera.near,
+            far_plane=camera.far,
+            radius_clip=self.radius_clip,
+            eps2d=self.eps2d,
             sh_degree=degree,
-            campos=camera.camera_center.float(),
-            prefiltered=False,
-            debug=False,
+            packed=self.packed,
+            backgrounds=None,
+            render_mode=render_mode,
+            sparse_grad=self.sparse_grad,
+            absgrad=self.absgrad,
+            rasterize_mode=self.rasterize_mode,
         )
 
-        rasterizer = GaussianRasterizer(raster_settings=raster_settings)
-
-        rendered_image, radii = rasterizer(
-            means3D=gaussians.means,
-            means2D=screenspace_means,
-            shs=None,               # 已手动计算颜色，不传 SH
-            colors_precomp=colors,
-            opacities=gaussians.opacities,
-            scales=gaussians.scales,
-            rotations=gaussians.rotations,
-            cov3D_precomp=gaussians.compute_covariance_3d(),
-        )
-
-        visibility_filter = (radii > 0)
-
-        return RenderOutput(
-            image=rendered_image,
-            alpha=rendered_image.new_ones(1, camera.height, camera.width),  # 占位
-            depth=None,
-            radii=radii,
-            visibility_filter=visibility_filter,
-            screenspace_means=screenspace_means,
-        )
+        frame = colors.reshape(-1, camera.height, camera.width, colors.shape[-1])[0]
+        depth = None
+        if frame.shape[-1] > 3:
+            depth = frame[..., 3:].permute(2, 0, 1).contiguous()
+            frame = frame[..., :3]
+        image = frame.permute(2, 0, 1).contiguous()
+        alpha_frame = alphas.reshape(-1, camera.height, camera.width, alphas.shape[-1])[0]
+        alpha = alpha_frame.permute(2, 0, 1).contiguous()
+        if image.shape[0] == 3:
+            image = image + background.view(3, 1, 1) * (1.0 - alpha)
+        radii = meta.get("radii")
+        means2d = meta.get("means2d")
+        return RenderOutput(image=image, alpha=alpha, depth=depth, radii=radii, means2d=means2d, metadata=meta)
 
 
-# ---------------------------------------------------------------------------
-# 内部辅助
-# ---------------------------------------------------------------------------
-
-def _fov_to_tan(fov_rad: float) -> float:
-    import math
-    return math.tan(fov_rad / 2)
-
-
-def num_sh_coefficients(degree: int) -> int:
-    return (degree + 1) ** 2
+def _background_tensor(value: tuple[float, float, float] | Tensor, device: torch.device) -> Tensor:
+    if isinstance(value, Tensor):
+        return value.to(device=device, dtype=torch.float32)
+    return torch.tensor(value, dtype=torch.float32, device=device)

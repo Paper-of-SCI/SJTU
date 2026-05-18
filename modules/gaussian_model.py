@@ -1,451 +1,360 @@
-"""3DGS 核心场景表示：GaussianModel。
+"""Composable 3D Gaussian parameter container.
 
-以 nn.Module 形式持有所有可学习的高斯参数，提供激活属性访问器、
-协方差计算、点云初始化、PLY 存读以及致密化变异方法。
+This module owns only the learnable Gaussian state and basic mutation
+operations.  It does not know about datasets, training loops, or renderers.
 """
 
 from __future__ import annotations
 
 import math
-from typing import Optional
+from dataclasses import dataclass
+from typing import Dict, Iterable, Mapping, Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
 from torch import Tensor
 
-from utils.ply_io import gaussians_to_ply_dict, ply_dict_to_gaussians, read_ply, write_ply
-from modules.spherical_harmonics import SH_C0, num_sh_coefficients
+from modules.spherical_harmonics import num_sh_bases, rgb_to_sh
+
+
+PARAMETER_NAMES = (
+    "means",
+    "log_scales",
+    "quats",
+    "logit_opacities",
+    "features_dc",
+    "features_rest",
+)
+
+
+@dataclass(frozen=True)
+class GaussianTensors:
+    """Activated tensors consumed by renderers or custom external code."""
+
+    means: Tensor
+    scales: Tensor
+    quats: Tensor
+    opacities: Tensor
+    colors: Tensor
 
 
 class GaussianModel(nn.Module):
-    """3D 高斯场景模型。
+    """Learnable 3DGS scene state.
 
-    参数（均为 nn.Parameter）：
-        _means:      (N, 3)  世界坐标位置
-        _scales:     (N, 3)  log 尺度（激活后用 exp 得到真实尺度）
-        _rotations:  (N, 4)  四元数 wxyz（激活后 L2 归一化）
-        _opacities:  (N, 1)  pre-sigmoid 不透明度
-        _sh_dc:      (N, 1, 3)  0 阶 SH 系数（视角无关颜色）
-        _sh_rest:    (N, K, 3)  1~max 阶 SH 系数，K=(max_sh_degree+1)^2-1
-
-    梯度统计缓存（register_buffer，不参与优化）：
-        _gradient_accum: (N,) 2D 梯度范数累积
-        _gradient_denom: (N,) 累积步数（用于求均值）
+    Raw parameters are stored as ``nn.Parameter`` objects.  Public properties
+    expose activated values where needed: scales are positive, quaternions are
+    normalized, and opacities are in ``(0, 1)``.
     """
 
-    def __init__(self, max_sh_degree: int = 3) -> None:
+    def __init__(self, sh_degree: int = 3) -> None:
         super().__init__()
-        self.max_sh_degree = max_sh_degree
-        self._active_sh_degree = 0
-
-        # 参数会在 from_point_cloud 中通过 _reset_parameters 初始化
-        self._means:     nn.Parameter
-        self._scales:    nn.Parameter
-        self._rotations: nn.Parameter
-        self._opacities: nn.Parameter
-        self._sh_dc:     nn.Parameter
-        self._sh_rest:   nn.Parameter
-
-    def _reset_parameters(
-        self,
-        means: Tensor,
-        scales: Tensor,
-        rotations: Tensor,
-        opacities: Tensor,
-        sh_dc: Tensor,
-        sh_rest: Tensor,
-    ) -> None:
-        self._means     = nn.Parameter(means)
-        self._scales    = nn.Parameter(scales)
-        self._rotations = nn.Parameter(rotations)
-        self._opacities = nn.Parameter(opacities)
-        self._sh_dc     = nn.Parameter(sh_dc)
-        self._sh_rest   = nn.Parameter(sh_rest)
-
-        N = means.shape[0]
-        device = means.device
-        self.register_buffer("_gradient_accum", torch.zeros(N, device=device))
-        self.register_buffer("_gradient_denom", torch.zeros(N, device=device))
-
-    # ---- 激活属性 ----
-
-    @property
-    def means(self) -> Tensor:
-        """(N, 3) 高斯位置（无激活，直接返回）。"""
-        return self._means
-
-    @property
-    def scales(self) -> Tensor:
-        """(N, 3) 正值尺度（exp 激活）。"""
-        return torch.exp(self._scales)
-
-    @property
-    def rotations(self) -> Tensor:
-        """(N, 4) 单位四元数（L2 归一化）。"""
-        return nn.functional.normalize(self._rotations, dim=1)
-
-    @property
-    def opacities(self) -> Tensor:
-        """(N, 1) 不透明度，值域 (0, 1)（sigmoid 激活）。"""
-        return torch.sigmoid(self._opacities)
-
-    @property
-    def sh_coefficients(self) -> Tensor:
-        """(N, (max_sh_degree+1)^2, 3) 完整 SH 系数（dc + rest 拼接）。"""
-        return torch.cat([self._sh_dc, self._sh_rest], dim=1)
-
-    @property
-    def num_gaussians(self) -> int:
-        return self._means.shape[0]
-
-    @property
-    def active_sh_degree(self) -> int:
-        return self._active_sh_degree
-
-    def step_sh_degree(self) -> None:
-        """将激活的 SH 阶数 +1（最大到 max_sh_degree）。"""
-        self._active_sh_degree = min(self._active_sh_degree + 1, self.max_sh_degree)
-
-    # ---- 协方差 ----
-
-    def compute_covariance_3d(self) -> Tensor:
-        """计算 3D 协方差矩阵的上三角部分。
-
-        公式：Σ = R * diag(s)^2 * R^T
-
-        Returns:
-            (N, 6) float32，顺序 [σ_xx, σ_xy, σ_xz, σ_yy, σ_yz, σ_zz]，
-            与 diff-gaussian-rasterization 的 cov3D_precomp 接口匹配。
-        """
-        S = self.scales        # (N, 3)
-        R = _qvec_to_rotmat(self.rotations)   # (N, 3, 3)
-
-        # Σ = R S^2 R^T
-        S2 = torch.diag_embed(S * S)          # (N, 3, 3)
-        cov = R @ S2 @ R.transpose(1, 2)      # (N, 3, 3)
-
-        # 取上三角
-        return torch.stack([
-            cov[:, 0, 0], cov[:, 0, 1], cov[:, 0, 2],
-            cov[:, 1, 1], cov[:, 1, 2],
-            cov[:, 2, 2],
-        ], dim=1)  # (N, 6)
-
-    # ---- 初始化 ----
+        if sh_degree < 0:
+            raise ValueError("sh_degree must be non-negative")
+        self.sh_degree = int(sh_degree)
+        self.means = nn.Parameter(torch.empty(0, 3))
+        self.log_scales = nn.Parameter(torch.empty(0, 3))
+        self.quats = nn.Parameter(torch.empty(0, 4))
+        self.logit_opacities = nn.Parameter(torch.empty(0, 1))
+        self.features_dc = nn.Parameter(torch.empty(0, 1, 3))
+        self.features_rest = nn.Parameter(torch.empty(0, max(num_sh_bases(sh_degree) - 1, 0), 3))
+        self.register_buffer("gradient_accum", torch.empty(0))
+        self.register_buffer("gradient_count", torch.empty(0))
 
     @classmethod
     def from_point_cloud(
         cls,
-        xyz: np.ndarray,           # (M, 3) float64
-        rgb: np.ndarray,           # (M, 3) uint8 或 float32 [0,1]
-        max_sh_degree: int = 3,
-        device: str = "cuda",
+        xyz: np.ndarray | Tensor,
+        rgb: np.ndarray | Tensor,
+        sh_degree: int = 3,
+        device: str | torch.device = "cuda",
+        initial_opacity: float = 0.1,
+        knn: int = 3,
     ) -> "GaussianModel":
-        """从 COLMAP 稀疏点云初始化 GaussianModel。
-
-        - 位置 = 点云坐标
-        - 尺度 = log(mean_knn_distance)（k=3 近邻均值距离）
-        - 旋转 = 单位四元数（恒等旋转）
-        - 不透明度 = inverse_sigmoid(0.1)
-        - SH DC = C0 * (rgb / 255 - 0.5)，高阶 SH = 0
+        """Initialize one Gaussian per point.
 
         Args:
-            xyz: 点云坐标，(M, 3)。
-            rgb: 颜色，uint8 [0,255] 或 float32 [0,1]。
-            max_sh_degree: 最大 SH 阶数（0~3）。
-            device: PyTorch 设备。
+            xyz: Point coordinates with shape ``(N, 3)``.
+            rgb: Point colors as uint8 ``[0,255]`` or float ``[0,1]``.
+            sh_degree: Maximum SH degree stored in the model.
+            device: Target torch device.
+            initial_opacity: Initial post-sigmoid opacity.
+            knn: Number of neighbors used for scale initialization.
         """
-        model = cls(max_sh_degree=max_sh_degree)
+        model = cls(sh_degree=sh_degree).to(device)
+        xyz_t = _to_float_tensor(xyz, device)
+        if xyz_t.ndim != 2 or xyz_t.shape[-1] != 3:
+            raise ValueError("xyz must have shape (N, 3)")
+        rgb_t = _to_rgb_tensor(rgb, device)
+        if rgb_t.shape != xyz_t.shape:
+            raise ValueError("rgb must have shape (N, 3)")
 
-        xyz_t = torch.tensor(xyz, dtype=torch.float32, device=device)
-        N = xyz_t.shape[0]
+        n = xyz_t.shape[0]
+        mean_dist = _mean_neighbor_distance(xyz_t, k=knn).clamp_min(1e-7)
+        log_scales = mean_dist.log().unsqueeze(-1).expand(n, 3).contiguous()
 
-        # 尺度：用 k=3 近邻均值距离初始化（log 空间）
-        dists = _mean_knn_distance(xyz_t, k=3)            # (N,)
-        log_scale = torch.log(torch.sqrt(dists + 1e-8))   # (N,)
-        scales = log_scale.unsqueeze(1).expand(-1, 3)      # (N, 3)
+        quats = xyz_t.new_zeros(n, 4)
+        quats[:, 0] = 1.0
 
-        # 旋转：恒等四元数 [1, 0, 0, 0]（wxyz）
-        rotations = torch.zeros(N, 4, device=device)
-        rotations[:, 0] = 1.0
+        opacity = float(np.clip(initial_opacity, 1e-4, 1.0 - 1e-4))
+        logit_opacity = math.log(opacity / (1.0 - opacity))
+        logit_opacities = xyz_t.new_full((n, 1), logit_opacity)
 
-        # 不透明度
-        inv_sig_01 = math.log(0.1 / 0.9)   # inverse_sigmoid(0.1)
-        opacities = torch.full((N, 1), inv_sig_01, dtype=torch.float32, device=device)
-
-        # SH DC：从 RGB 颜色计算
-        if rgb.dtype == np.uint8:
-            rgb_f = rgb.astype(np.float32) / 255.0
-        else:
-            rgb_f = rgb.astype(np.float32)
-        rgb_t = torch.tensor(rgb_f, dtype=torch.float32, device=device)  # (N, 3)
-        sh_dc = (rgb_t - 0.5) / SH_C0   # (N, 3)
-        sh_dc = sh_dc.unsqueeze(1)       # (N, 1, 3)
-
-        # 高阶 SH：全零
-        K = num_sh_coefficients(max_sh_degree) - 1
-        sh_rest = torch.zeros(N, K, 3, device=device)
-
-        model._reset_parameters(
-            means=xyz_t,
-            scales=scales,
-            rotations=rotations,
-            opacities=opacities,
-            sh_dc=sh_dc,
-            sh_rest=sh_rest,
+        features_dc = rgb_to_sh(rgb_t).unsqueeze(1)
+        features_rest = xyz_t.new_zeros(n, max(num_sh_bases(sh_degree) - 1, 0), 3)
+        model.replace_tensors(
+            {
+                "means": xyz_t,
+                "log_scales": log_scales,
+                "quats": quats,
+                "logit_opacities": logit_opacities,
+                "features_dc": features_dc,
+                "features_rest": features_rest,
+            }
         )
         return model
 
-    # ---- 存读 PLY ----
-
-    def save_ply(self, path: str) -> None:
-        """将所有参数保存为 3DGS 格式的 PLY 文件。"""
-        with torch.no_grad():
-            means_np     = self._means.cpu().numpy()
-            scales_np    = self._scales.cpu().numpy()
-            rotations_np = self._rotations.cpu().numpy()
-            opacities_np = self._opacities.cpu().numpy()
-            sh_dc_np     = self._sh_dc.cpu().numpy()
-            sh_rest_np   = self._sh_rest.cpu().numpy()
-
-        ply_dict = gaussians_to_ply_dict(
-            means_np, scales_np, rotations_np, opacities_np, sh_dc_np, sh_rest_np
-        )
-        write_ply(path, ply_dict, binary=True)
-
-    @classmethod
-    def load_ply(
-        cls,
-        path: str,
-        device: str = "cuda",
-    ) -> "GaussianModel":
-        """从 PLY checkpoint 恢复 GaussianModel。"""
-        data = read_ply(path)
-        means, scales, rotations, opacities, sh_dc, sh_rest = ply_dict_to_gaussians(data)
-
-        # 从 SH 系数推断 max_sh_degree
-        K_rest = sh_rest.shape[1]   # K = (degree+1)^2 - 1
-        max_sh_degree = 0
-        for deg in range(1, 4):
-            if num_sh_coefficients(deg) - 1 >= K_rest:
-                max_sh_degree = deg - 1
-                break
-        else:
-            max_sh_degree = 3
-
-        model = cls(max_sh_degree=max_sh_degree)
-        model._reset_parameters(
-            means=torch.tensor(means,     dtype=torch.float32, device=device),
-            scales=torch.tensor(scales,   dtype=torch.float32, device=device),
-            rotations=torch.tensor(rotations, dtype=torch.float32, device=device),
-            opacities=torch.tensor(opacities, dtype=torch.float32, device=device),
-            sh_dc=torch.tensor(sh_dc,     dtype=torch.float32, device=device),
-            sh_rest=torch.tensor(sh_rest, dtype=torch.float32, device=device),
-        )
-        return model
-
-    # ---- 梯度统计 ----
-
-    def update_gradient_stats(self, screenspace_grads: Tensor, visibility: Tensor) -> None:
-        """累积 2D 屏幕空间梯度统计，供 DensificationController 使用。
-
-        Args:
-            screenspace_grads: (N, 2) 屏幕空间均值梯度。
-            visibility: (N,) bool，True 表示该高斯在本帧可见。
-        """
-        norms = screenspace_grads.norm(dim=1)   # (N,)
-        self._gradient_accum[visibility] += norms[visibility]
-        self._gradient_denom[visibility] += 1
-
-    def reset_gradient_stats(self) -> None:
-        self._gradient_accum.zero_()
-        self._gradient_denom.zero_()
+    @property
+    def num_gaussians(self) -> int:
+        return int(self.means.shape[0])
 
     @property
-    def gradient_accum(self) -> Tensor:
-        return self._gradient_accum
+    def scales(self) -> Tensor:
+        return self.log_scales.exp()
 
     @property
-    def gradient_denom(self) -> Tensor:
-        return self._gradient_denom
+    def normalized_quats(self) -> Tensor:
+        return torch.nn.functional.normalize(self.quats, dim=-1)
 
-    # ---- 变异方法（由 DensificationController 调用）----
+    @property
+    def opacities(self) -> Tensor:
+        return self.logit_opacities.sigmoid().squeeze(-1)
 
-    def densify_and_clone(self, mask: Tensor) -> None:
-        """复制梯度大且尺度小的高斯（in-place）。
+    @property
+    def colors(self) -> Tensor:
+        return torch.cat([self.features_dc, self.features_rest], dim=1)
 
-        Args:
-            mask: (N,) bool，True 表示需要克隆的高斯。
+    def activated_tensors(self) -> GaussianTensors:
+        """Return the tensors expected by ``gsplat.rasterization``."""
+        return GaussianTensors(
+            means=self.means,
+            scales=self.scales,
+            quats=self.normalized_quats,
+            opacities=self.opacities,
+            colors=self.colors,
+        )
+
+    def parameter_map(self) -> Dict[str, nn.Parameter]:
+        """Return named raw parameters used by optimizer helpers."""
+        return {name: getattr(self, name) for name in PARAMETER_NAMES}
+
+    def replace_tensors(self, tensors: Mapping[str, Tensor]) -> None:
+        """Replace all raw parameter tensors and reset gradient statistics."""
+        missing = [name for name in PARAMETER_NAMES if name not in tensors]
+        if missing:
+            raise KeyError(f"missing tensors: {missing}")
+        for name in PARAMETER_NAMES:
+            setattr(self, name, nn.Parameter(tensors[name].detach().clone()))
+        self._reset_gradient_buffers(self.num_gaussians, self.means.device)
+
+    def append_tensors(self, tensors: Mapping[str, Tensor]) -> int:
+        """Append new Gaussians from raw parameter tensors.
+
+        Returns:
+            Number of appended Gaussians.
         """
-        new_means     = self._means[mask].detach()
-        new_scales    = self._scales[mask].detach()
-        new_rots      = self._rotations[mask].detach()
-        new_opacities = self._opacities[mask].detach()
-        new_sh_dc     = self._sh_dc[mask].detach()
-        new_sh_rest   = self._sh_rest[mask].detach()
+        if not tensors:
+            return 0
+        n_new = _infer_count(tensors.values())
+        if n_new == 0:
+            return 0
+        updated = {}
+        for name in PARAMETER_NAMES:
+            base = getattr(self, name).detach()
+            extra = tensors[name].to(device=base.device, dtype=base.dtype).detach()
+            updated[name] = torch.cat([base, extra], dim=0)
+        self.replace_tensors(updated)
+        return n_new
 
-        self._concat_parameters(new_means, new_scales, new_rots,
-                                new_opacities, new_sh_dc, new_sh_rest)
+    def clone(self, mask: Tensor) -> int:
+        """Append exact copies of selected Gaussians."""
+        mask = _as_bool_mask(mask, self.num_gaussians, self.means.device)
+        tensors = {name: getattr(self, name).detach()[mask] for name in PARAMETER_NAMES}
+        return self.append_tensors(tensors)
 
-    def densify_and_split(
-        self,
-        mask: Tensor,
-        num_splits: int = 2,
-    ) -> None:
-        """分裂梯度大且尺度大的高斯（in-place）。
+    def split(self, mask: Tensor, num_splits: int = 2, scale_shrink: float = 1.6) -> tuple[int, Tensor]:
+        """Append split children and remove selected parents.
 
-        新高斯的位置从原高斯的 3D 分布中采样，尺度缩小 1.6 倍。
-
-        Args:
-            mask: (N,) bool，True 表示需要分裂的高斯。
-            num_splits: 每个高斯分裂为多少个新高斯（默认 2）。
+        Returns:
+            ``(num_added, keep_mask_after_append)``.  The keep mask is useful
+            for external optimizer-state patching.
         """
+        if num_splits < 1:
+            raise ValueError("num_splits must be >= 1")
+        mask = _as_bool_mask(mask, self.num_gaussians, self.means.device)
         selected = mask.nonzero(as_tuple=True)[0]
-        if len(selected) == 0:
-            return
+        if selected.numel() == 0:
+            return 0, torch.ones(self.num_gaussians, dtype=torch.bool, device=self.means.device)
 
-        M = len(selected)
-        means_sel     = self._means[selected]      # (M, 3)
-        scales_sel    = self._scales[selected]
-        rots_sel      = self._rotations[selected]
-        opacities_sel = self._opacities[selected]
-        sh_dc_sel     = self._sh_dc[selected]
-        sh_rest_sel   = self._sh_rest[selected]
+        means = self.means.detach()[selected]
+        log_scales = self.log_scales.detach()[selected]
+        quats = self.normalized_quats.detach()[selected]
+        rotations = quats_to_rotmats(quats)
+        scales = log_scales.exp()
 
-        # 从原高斯分布中采样新位置
-        stds = torch.exp(scales_sel).unsqueeze(1).expand(-1, num_splits, -1)  # (M, S, 3)
-        rots_mat = _qvec_to_rotmat(nn.functional.normalize(rots_sel, dim=1))  # (M, 3, 3)
+        samples = torch.randn(selected.numel(), num_splits, 3, device=self.means.device, dtype=self.means.dtype)
+        local_offsets = samples * scales[:, None, :]
+        offsets = torch.matmul(rotations[:, None, :, :], local_offsets[..., None]).squeeze(-1)
 
-        # 采样 num_splits 份偏移
-        samples = torch.randn(M, num_splits, 3, device=self._means.device)
-        # 旋转到世界坐标
-        offsets = (rots_mat.unsqueeze(1) @ (stds * samples).unsqueeze(-1)).squeeze(-1)  # (M, S, 3)
-        new_means = (means_sel.unsqueeze(1) + offsets).reshape(-1, 3)  # (M*S, 3)
+        new_tensors = {
+            "means": (means[:, None, :] + offsets).reshape(-1, 3),
+            "log_scales": (log_scales - math.log(scale_shrink))[:, None, :].expand(-1, num_splits, -1).reshape(-1, 3),
+            "quats": self.quats.detach()[selected][:, None, :].expand(-1, num_splits, -1).reshape(-1, 4),
+            "logit_opacities": self.logit_opacities.detach()[selected][:, None, :].expand(-1, num_splits, -1).reshape(-1, 1),
+            "features_dc": self.features_dc.detach()[selected][:, None, :, :].expand(-1, num_splits, -1, -1).reshape(-1, 1, 3),
+            "features_rest": self.features_rest.detach()[selected][:, None, :, :].expand(-1, num_splits, -1, -1).reshape(
+                -1, self.features_rest.shape[1], 3
+            ),
+        }
 
-        # 尺度缩小
-        new_scales    = (scales_sel - math.log(1.6)).unsqueeze(1).expand(-1, num_splits, -1).reshape(-1, 3)
-        new_rots      = rots_sel.unsqueeze(1).expand(-1, num_splits, -1).reshape(-1, 4)
-        new_opacities = opacities_sel.unsqueeze(1).expand(-1, num_splits, -1).reshape(-1, 1)
-        new_sh_dc     = sh_dc_sel.unsqueeze(1).expand(-1, num_splits, -1, -1).reshape(-1, *sh_dc_sel.shape[1:])
-        new_sh_rest   = sh_rest_sel.unsqueeze(1).expand(-1, num_splits, -1, -1).reshape(-1, *sh_rest_sel.shape[1:])
+        old_n = self.num_gaussians
+        added = self.append_tensors(new_tensors)
+        keep = torch.ones(old_n + added, dtype=torch.bool, device=self.means.device)
+        keep[selected] = False
+        self.prune(~keep)
+        return added, keep
 
-        # 移除原来的高斯，添加新高斯
-        keep_mask = ~mask
-        self._prune_with_mask(keep_mask)
-        self._concat_parameters(
-            new_means.detach(), new_scales.detach(), new_rots.detach(),
-            new_opacities.detach(), new_sh_dc.detach(), new_sh_rest.detach()
-        )
+    def prune(self, remove_mask: Tensor) -> Tensor:
+        """Remove Gaussians where ``remove_mask`` is true.
 
-    def prune(self, mask: Tensor) -> None:
-        """移除 mask 为 True 的高斯（in-place）。
-
-        Args:
-            mask: (N,) bool，True 表示需要移除的高斯。
+        Returns:
+            The keep mask used after pruning.
         """
-        self._prune_with_mask(~mask)
+        remove_mask = _as_bool_mask(remove_mask, self.num_gaussians, self.means.device)
+        keep = ~remove_mask
+        updated = {name: getattr(self, name).detach()[keep] for name in PARAMETER_NAMES}
+        self.replace_tensors(updated)
+        return keep
 
     def reset_opacities(self, value: float = 0.01) -> None:
-        """将所有高斯的不透明度重置为指定值（pre-sigmoid）。"""
-        inv_sig = math.log(value / (1 - value))
+        value = float(np.clip(value, 1e-4, 1.0 - 1e-4))
+        logit = math.log(value / (1.0 - value))
         with torch.no_grad():
-            self._opacities.fill_(inv_sig)
+            self.logit_opacities.fill_(logit)
 
-    # ---- 内部工具 ----
-
-    def _prune_with_mask(self, keep_mask: Tensor) -> None:
-        """保留 keep_mask 为 True 的高斯，更新所有参数（in-place 替换）。"""
-        def _masked(param: nn.Parameter) -> nn.Parameter:
-            return nn.Parameter(param.data[keep_mask])
-
-        self._means     = _masked(self._means)
-        self._scales    = _masked(self._scales)
-        self._rotations = _masked(self._rotations)
-        self._opacities = _masked(self._opacities)
-        self._sh_dc     = _masked(self._sh_dc)
-        self._sh_rest   = _masked(self._sh_rest)
-
-        self._gradient_accum = self._gradient_accum[keep_mask]
-        self._gradient_denom = self._gradient_denom[keep_mask]
-
-    def _concat_parameters(
+    def accumulate_gradient_stats(
         self,
-        new_means: Tensor,
-        new_scales: Tensor,
-        new_rots: Tensor,
-        new_opacities: Tensor,
-        new_sh_dc: Tensor,
-        new_sh_rest: Tensor,
+        means2d: Tensor,
+        visibility: Optional[Tensor] = None,
+        use_absgrad: bool = True,
+        indices: Optional[Tensor] = None,
     ) -> None:
-        """将新高斯追加到现有参数末尾（in-place 替换）。"""
-        N_new = new_means.shape[0]
-        device = self._means.device
+        """Accumulate screen-space mean gradients for densification."""
+        grad = getattr(means2d, "absgrad", None) if use_absgrad else None
+        if grad is None:
+            grad = means2d.grad
+        if grad is None:
+            return
+        grad = grad.reshape(-1, grad.shape[-1])[:, :2]
+        norms = grad.norm(dim=-1)
+        if indices is not None:
+            indices = indices.reshape(-1).to(device=norms.device, dtype=torch.long)
+            if indices.numel() != norms.numel():
+                return
+            valid = (indices >= 0) & (indices < self.num_gaussians)
+            if visibility is not None:
+                visibility = visibility.reshape(-1).to(device=norms.device, dtype=torch.bool)
+                if visibility.numel() == norms.numel():
+                    valid = valid & visibility
+            if not bool(valid.any()):
+                return
+            indices = indices[valid]
+            norms = norms[valid]
+            self.gradient_accum.index_add_(0, indices.to(self.gradient_accum.device), norms.to(self.gradient_accum.device))
+            self.gradient_count.index_add_(0, indices.to(self.gradient_count.device), torch.ones_like(norms, device=self.gradient_count.device))
+            return
+        if norms.numel() != self.num_gaussians:
+            return
+        if visibility is None:
+            visibility = torch.ones_like(norms, dtype=torch.bool)
+        else:
+            visibility = visibility.reshape(-1).to(device=norms.device, dtype=torch.bool)
+            if visibility.numel() != norms.numel():
+                visibility = torch.ones_like(norms, dtype=torch.bool)
+        self.gradient_accum[visibility] += norms[visibility]
+        self.gradient_count[visibility] += 1
 
-        def _cat(param: nn.Parameter, new_data: Tensor) -> nn.Parameter:
-            return nn.Parameter(torch.cat([param.data, new_data], dim=0))
+    def clear_gradient_stats(self) -> None:
+        self.gradient_accum.zero_()
+        self.gradient_count.zero_()
 
-        self._means     = _cat(self._means,     new_means)
-        self._scales    = _cat(self._scales,    new_scales)
-        self._rotations = _cat(self._rotations, new_rots)
-        self._opacities = _cat(self._opacities, new_opacities)
-        self._sh_dc     = _cat(self._sh_dc,     new_sh_dc)
-        self._sh_rest   = _cat(self._sh_rest,   new_sh_rest)
-
-        self._gradient_accum = torch.cat([self._gradient_accum, torch.zeros(N_new, device=device)])
-        self._gradient_denom = torch.cat([self._gradient_denom, torch.zeros(N_new, device=device)])
+    def _reset_gradient_buffers(self, count: int, device: torch.device) -> None:
+        self.gradient_accum = torch.zeros(count, device=device)
+        self.gradient_count = torch.zeros(count, device=device)
 
 
-# ---------------------------------------------------------------------------
-# 内部辅助
-# ---------------------------------------------------------------------------
-
-def _qvec_to_rotmat(qvec: Tensor) -> Tensor:
-    """批量四元数 wxyz → 旋转矩阵。
-
-    Args:
-        qvec: (N, 4) 单位四元数。
-
-    Returns:
-        (N, 3, 3) 旋转矩阵。
-    """
-    w = qvec[:, 0:1]
-    x = qvec[:, 1:2]
-    y = qvec[:, 2:3]
-    z = qvec[:, 3:4]
-    R = torch.stack([
-        1 - 2*(y*y + z*z),   2*(x*y - w*z),       2*(x*z + w*y),
-        2*(x*y + w*z),        1 - 2*(x*x + z*z),   2*(y*z - w*x),
-        2*(x*z - w*y),        2*(y*z + w*x),        1 - 2*(x*x + y*y),
-    ], dim=1).reshape(-1, 3, 3)
-    return R
+def quats_to_rotmats(quats: Tensor) -> Tensor:
+    """Convert normalized wxyz quaternions to rotation matrices."""
+    q = torch.nn.functional.normalize(quats, dim=-1)
+    w, x, y, z = q.unbind(-1)
+    return torch.stack(
+        [
+            1 - 2 * (y * y + z * z),
+            2 * (x * y - w * z),
+            2 * (x * z + w * y),
+            2 * (x * y + w * z),
+            1 - 2 * (x * x + z * z),
+            2 * (y * z - w * x),
+            2 * (x * z - w * y),
+            2 * (y * z + w * x),
+            1 - 2 * (x * x + y * y),
+        ],
+        dim=-1,
+    ).reshape(-1, 3, 3)
 
 
-def _mean_knn_distance(xyz: Tensor, k: int = 3) -> Tensor:
-    """计算每个点到 k 近邻的均值平方距离。
+def _to_float_tensor(value: np.ndarray | Tensor, device: str | torch.device) -> Tensor:
+    if isinstance(value, Tensor):
+        return value.to(device=device, dtype=torch.float32)
+    return torch.as_tensor(value, dtype=torch.float32, device=device)
 
-    Args:
-        xyz: (N, 3) 点云。
-        k: 近邻数量。
 
-    Returns:
-        (N,) 均值平方距离。
-    """
-    N = xyz.shape[0]
-    if N <= k:
-        return torch.ones(N, device=xyz.device) * 0.01
+def _to_rgb_tensor(value: np.ndarray | Tensor, device: str | torch.device) -> Tensor:
+    if isinstance(value, Tensor):
+        rgb = value.to(device=device, dtype=torch.float32)
+        return rgb / 255.0 if rgb.max() > 1.0 else rgb
+    arr = np.asarray(value)
+    rgb = torch.as_tensor(arr, dtype=torch.float32, device=device)
+    return rgb / 255.0 if arr.dtype == np.uint8 or float(rgb.max()) > 1.0 else rgb
 
-    # 分批计算避免显存不足
-    batch = min(4096, N)
-    dists = []
-    for i in range(0, N, batch):
-        chunk = xyz[i:i+batch]                                    # (B, 3)
-        diff = chunk.unsqueeze(1) - xyz.unsqueeze(0)             # (B, N, 3)
-        sq = (diff ** 2).sum(dim=2)                              # (B, N)
-        # 排除自身（设为大值）
-        sq[:, i:i+batch] = sq[:, i:i+batch] + torch.eye(
-            min(batch, N-i), N, device=xyz.device
-        )[:, i:i+batch] * 1e9
-        topk = torch.topk(sq, k, dim=1, largest=False).values   # (B, k)
-        dists.append(topk.mean(dim=1))
-    return torch.cat(dists)
+
+def _mean_neighbor_distance(xyz: Tensor, k: int = 3, chunk_size: int = 4096) -> Tensor:
+    n = xyz.shape[0]
+    if n <= 1:
+        return xyz.new_full((n,), 0.01)
+    k = min(max(int(k), 1), n - 1)
+    out = []
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        d = torch.cdist(xyz[start:end], xyz)
+        row = torch.arange(end - start, device=xyz.device)
+        d[row, torch.arange(start, end, device=xyz.device)] = float("inf")
+        out.append(d.topk(k, largest=False).values.mean(dim=-1))
+    return torch.cat(out, dim=0).clamp_min(1e-6)
+
+
+def _as_bool_mask(mask: Tensor, count: int, device: torch.device) -> Tensor:
+    mask = mask.to(device=device, dtype=torch.bool).reshape(-1)
+    if mask.numel() != count:
+        raise ValueError(f"mask length {mask.numel()} does not match Gaussian count {count}")
+    return mask
+
+
+def _infer_count(values: Iterable[Tensor]) -> int:
+    iterator = iter(values)
+    first = next(iterator)
+    count = int(first.shape[0])
+    for tensor in iterator:
+        if int(tensor.shape[0]) != count:
+            raise ValueError("all tensors must have the same first dimension")
+    return count

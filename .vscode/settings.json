@@ -6,6 +6,7 @@
         "**/.DS_Store": true,
         "**/Thumbs.db": true,
         "**/.gitignore": false,
+        "**/__init__.py": false
     },
     "python-envs.defaultEnvManager": "ms-python.python:conda",
     "python-envs.defaultPackageManager": "ms-python.python:conda"
