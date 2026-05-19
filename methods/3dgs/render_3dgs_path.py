@@ -22,8 +22,8 @@ from utils.ply_io import ply_dict_to_gaussians, read_ply
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Render novel 3DGS camera paths.")
     parser.add_argument("--data", default="src/datasets/SeathruNeRF_dataset/Curasao", help="Scene directory.")
-    parser.add_argument("--checkpoint", default="outputs/curasao_3dgs/final.ply", help="3DGS Gaussian PLY checkpoint.")
-    parser.add_argument("--out", default="outputs/curasao_3dgs/path_interpolate", help="Output frame directory.")
+    parser.add_argument("--checkpoint", default="outputs/3dgs_scene/final.ply", help="3DGS Gaussian PLY checkpoint.")
+    parser.add_argument("--out", default="outputs/3dgs_scene/path_interpolate", help="Output frame directory.")
     parser.add_argument("--mode", default="interpolate", choices=["interpolate", "orbit"], help="Novel-view path type.")
     parser.add_argument("--split", default="train", choices=["train", "test", "val"], help="Reference camera split.")
     parser.add_argument("--factor", type=int, default=4, help="Image downscale factor.")

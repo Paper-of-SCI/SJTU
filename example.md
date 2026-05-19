@@ -22,7 +22,7 @@ COLMAP 数据
 当前仓库对应的训练入口：
 
 ```text
-methods/3dgs/train_3dgs_curasao.py
+methods/3dgs/train_3dgs_scene.py
 ```
 
 核心模块：
@@ -302,7 +302,7 @@ point_cloud_rgb  shape (N, 3)
 
 训练脚本调用：
 
-文件：`methods/3dgs/train_3dgs_curasao.py`
+文件：`methods/3dgs/train_3dgs_scene.py`
 
 ```python
 model = GaussianModel.from_point_cloud(
@@ -566,7 +566,7 @@ colors = concat(features_dc, features_rest)
 
 训练脚本先构造所有训练相机：
 
-文件：`methods/3dgs/train_3dgs_curasao.py`
+文件：`methods/3dgs/train_3dgs_scene.py`
 
 ```python
 train_cameras = build_cameras(scene, device)
@@ -611,7 +611,7 @@ near/far   渲染裁剪范围
 
 训练循环在：
 
-文件：`methods/3dgs/train_3dgs_curasao.py`
+文件：`methods/3dgs/train_3dgs_scene.py`
 
 ```python
 for step in progress:
@@ -915,7 +915,7 @@ T_final(p) = product over all i:
 
 仓库里白背景来自：
 
-文件：`methods/3dgs/train_3dgs_curasao.py`
+文件：`methods/3dgs/train_3dgs_scene.py`
 
 ```python
 renderer = GaussianRenderer(background=(1.0, 1.0, 1.0))
@@ -1055,7 +1055,7 @@ render.metadata["gaussian_ids"]
 
 训练脚本调用：
 
-文件：`methods/3dgs/train_3dgs_curasao.py`
+文件：`methods/3dgs/train_3dgs_scene.py`
 
 ```python
 loss, parts = photometric_loss(
@@ -1194,7 +1194,7 @@ prune   删除没贡献的 Gaussian
 
 训练脚本调用：
 
-文件：`methods/3dgs/train_3dgs_curasao.py`
+文件：`methods/3dgs/train_3dgs_scene.py`
 
 ```python
 stats = densifier.update(model, render, optimizer, step)
@@ -1414,7 +1414,7 @@ reset_opacity = 0.01
 
 训练时会定期算测试集 PSNR：
 
-文件：`methods/3dgs/train_3dgs_curasao.py`
+文件：`methods/3dgs/train_3dgs_scene.py`
 
 ```python
 eval_psnr = evaluate_psnr(model, renderer, test_cameras)
@@ -1460,18 +1460,18 @@ evaluate_psnr 不反传
 训练过程中定期保存：
 
 ```text
-outputs/curasao_3dgs/checkpoints/step_XXXXXX.ply
+outputs/3dgs_scene/checkpoints/step_XXXXXX.ply
 ```
 
 训练结束保存：
 
 ```text
-outputs/curasao_3dgs/final.ply
+outputs/3dgs_scene/final.ply
 ```
 
 训练脚本：
 
-文件：`methods/3dgs/train_3dgs_curasao.py`
+文件：`methods/3dgs/train_3dgs_scene.py`
 
 ```python
 save_checkpoint(out_dir / "final.ply", model)
@@ -1517,15 +1517,15 @@ rot_*
 入口：
 
 ```text
-methods/3dgs/render_3dgs_curasao.py
+methods/3dgs/render_3dgs_views.py
 ```
 
 运行：
 
 ```bash
-python methods/3dgs/render_3dgs_curasao.py \
-  --checkpoint outputs/curasao_3dgs/final.ply \
-  --out outputs/curasao_3dgs/renders_test \
+python methods/3dgs/render_3dgs_views.py \
+  --checkpoint outputs/3dgs_scene/final.ply \
+  --out outputs/3dgs_scene/renders_test \
   --split test \
   --factor 4
 ```
@@ -1566,8 +1566,8 @@ methods/3dgs/render_3dgs_path.py
 
 ```bash
 python methods/3dgs/render_3dgs_path.py \
-  --checkpoint outputs/curasao_3dgs/final.ply \
-  --out outputs/curasao_3dgs/path_interpolate \
+  --checkpoint outputs/3dgs_scene/final.ply \
+  --out outputs/3dgs_scene/path_interpolate \
   --mode interpolate \
   --split train \
   --factor 4 \
@@ -1597,8 +1597,8 @@ python methods/3dgs/render_3dgs_path.py \
 
 ```bash
 python methods/3dgs/render_3dgs_path.py \
-  --checkpoint outputs/curasao_3dgs/final.ply \
-  --out outputs/curasao_3dgs/path_orbit \
+  --checkpoint outputs/3dgs_scene/final.ply \
+  --out outputs/3dgs_scene/path_orbit \
   --mode orbit \
   --split train \
   --factor 4 \
@@ -1675,7 +1675,7 @@ python methods/3dgs/render_3dgs_path.py \
 7. modules/densification.py
    看 update(), _densify(), clone/split/prune 条件
 
-8. methods/3dgs/train_3dgs_curasao.py
+8. methods/3dgs/train_3dgs_scene.py
    回来看 main() 怎么把这些模块串起来
 ```
 

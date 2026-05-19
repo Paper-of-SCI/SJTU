@@ -1,4 +1,4 @@
-"""Render a trained 3DGS PLY checkpoint on Curasao cameras."""
+"""Render a trained 3DGS PLY checkpoint on dataset camera views."""
 
 from __future__ import annotations
 
@@ -19,10 +19,10 @@ from utils.ply_io import ply_dict_to_gaussians, read_ply
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Render a 3DGS PLY checkpoint on Curasao.")
-    parser.add_argument("--data", default="src/datasets/SeathruNeRF_dataset/Curasao", help="Curasao scene directory.")
-    parser.add_argument("--checkpoint", default="outputs/curasao_3dgs/final.ply", help="3DGS Gaussian PLY checkpoint.")
-    parser.add_argument("--out", default="outputs/curasao_3dgs/renders", help="Output render directory.")
+    parser = argparse.ArgumentParser(description="Render a 3DGS PLY checkpoint on dataset camera views.")
+    parser.add_argument("--data", default="src/datasets/SeathruNeRF_dataset/Curasao", help="COLMAP scene directory.")
+    parser.add_argument("--checkpoint", default="outputs/3dgs_scene/final.ply", help="3DGS Gaussian PLY checkpoint.")
+    parser.add_argument("--out", default="outputs/3dgs_scene/renders", help="Output render directory.")
     parser.add_argument("--split", default="test", choices=["train", "test", "val"], help="Camera split to render.")
     parser.add_argument("--factor", type=int, default=4, help="Image downscale factor.")
     parser.add_argument("--holdout", type=int, default=8, help="Holdout interval.")

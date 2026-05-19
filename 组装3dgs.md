@@ -1,8 +1,8 @@
-# 组装 3DGS 训练 Curasao
+# 组装 3DGS 通用 COLMAP 场景训练
 
-目标：把仓库里已经拆好的 `utils/` 和 `modules/` 组装成一个可运行的 Curasao 3D Gaussian Splatting 训练、评估、渲染流程。
+目标：把仓库里已经拆好的 `utils/` 和 `modules/` 组装成一个可运行的 COLMAP 场景 3D Gaussian Splatting 训练、评估、渲染流程。
 
-数据目录：
+默认示例数据目录：
 
 ```text
 src/datasets/SeathruNeRF_dataset/Curasao
@@ -11,14 +11,14 @@ src/datasets/SeathruNeRF_dataset/Curasao
 当前可运行入口在：
 
 ```text
-methods/3dgs/train_3dgs_curasao.py
-methods/3dgs/render_3dgs_curasao.py
+methods/3dgs/train_3dgs_scene.py
+methods/3dgs/render_3dgs_views.py
 methods/3dgs/render_3dgs_path.py
 ```
 
 ## 0. 先看总调用链
 
-训练主线从 `methods/3dgs/train_3dgs_curasao.py` 进入：
+训练主线从 `methods/3dgs/train_3dgs_scene.py` 进入：
 
 ```text
 parse_args()
@@ -54,7 +54,7 @@ parse_args()
 训练结束后看结果有两条线：
 
 ```text
-methods/3dgs/render_3dgs_curasao.py
+methods/3dgs/render_3dgs_views.py
   -> 用数据集里的 train/test/val 相机渲染，能和 GT 算 PSNR
 
 methods/3dgs/render_3dgs_path.py
@@ -94,7 +94,7 @@ PY
 
 ## 2. 第一步：训练脚本入口
 
-文件：`methods/3dgs/train_3dgs_curasao.py`
+文件：`methods/3dgs/train_3dgs_scene.py`
 
 先看这两个函数：
 
@@ -143,7 +143,7 @@ def main() -> None:
 
 ## 3. 第二步：解析输入输出路径
 
-文件：`methods/3dgs/train_3dgs_curasao.py`
+文件：`methods/3dgs/train_3dgs_scene.py`
 
 函数：
 
@@ -174,7 +174,7 @@ checkpoint_dir = out_dir / "checkpoints"
 输出目录结构会变成：
 
 ```text
-outputs/curasao_3dgs/
+outputs/3dgs_scene/
   previews/
   checkpoints/
   final.ply
@@ -184,7 +184,7 @@ outputs/curasao_3dgs/
 
 训练脚本调用：
 
-文件：`methods/3dgs/train_3dgs_curasao.py`
+文件：`methods/3dgs/train_3dgs_scene.py`
 
 ```python
 scene = load_colmap_dataset(
@@ -287,7 +287,7 @@ scene -> build_cameras() -> Camera.from_scene_data()
 
 训练脚本调用：
 
-文件：`methods/3dgs/train_3dgs_curasao.py`
+文件：`methods/3dgs/train_3dgs_scene.py`
 
 ```python
 model = GaussianModel.from_point_cloud(
@@ -374,7 +374,7 @@ save_checkpoint(..., model)
 
 训练脚本调用：
 
-文件：`methods/3dgs/train_3dgs_curasao.py`
+文件：`methods/3dgs/train_3dgs_scene.py`
 
 ```python
 renderer = GaussianRenderer(background=(1.0, 1.0, 1.0))
@@ -441,7 +441,7 @@ render.metadata   -> 取 gaussian_ids，给 packed gsplat 梯度回填用
 
 训练脚本调用：
 
-文件：`methods/3dgs/train_3dgs_curasao.py`
+文件：`methods/3dgs/train_3dgs_scene.py`
 
 ```python
 optimizer = build_3dgs_optimizer(model, OptimConfig())
@@ -499,7 +499,7 @@ def set_group_lr(optimizer: torch.optim.Optimizer, group_name: str, lr: float) -
 
 调用位置：
 
-文件：`methods/3dgs/train_3dgs_curasao.py`
+文件：`methods/3dgs/train_3dgs_scene.py`
 
 ```python
 set_group_lr(optimizer, "means", position_lr(step))
@@ -511,7 +511,7 @@ set_group_lr(optimizer, "means", position_lr(step))
 
 训练脚本调用：
 
-文件：`methods/3dgs/train_3dgs_curasao.py`
+文件：`methods/3dgs/train_3dgs_scene.py`
 
 ```python
 densifier = DensificationController(
@@ -601,7 +601,7 @@ def accumulate_gradient_stats(
 
 训练脚本调用：
 
-文件：`methods/3dgs/train_3dgs_curasao.py`
+文件：`methods/3dgs/train_3dgs_scene.py`
 
 ```python
 train_cameras = build_cameras(scene, device)
@@ -610,7 +610,7 @@ test_cameras = build_cameras(test_scene, device)
 
 本地辅助函数：
 
-文件：`methods/3dgs/train_3dgs_curasao.py`
+文件：`methods/3dgs/train_3dgs_scene.py`
 
 ```python
 def build_cameras(scene, device: torch.device) -> list[Camera]:
@@ -697,7 +697,7 @@ SceneData
 
 核心循环在：
 
-文件：`methods/3dgs/train_3dgs_curasao.py`
+文件：`methods/3dgs/train_3dgs_scene.py`
 
 ```python
 for step in progress:
@@ -762,7 +762,7 @@ for step in progress:
 
 训练循环调用：
 
-文件：`methods/3dgs/train_3dgs_curasao.py`
+文件：`methods/3dgs/train_3dgs_scene.py`
 
 ```python
 render = renderer.render(model, camera)
@@ -824,7 +824,7 @@ meta -> render.metadata
 
 训练循环调用：
 
-文件：`methods/3dgs/train_3dgs_curasao.py`
+文件：`methods/3dgs/train_3dgs_scene.py`
 
 ```python
 loss, parts = photometric_loss(
@@ -870,7 +870,7 @@ parts["ssim"] -> 打印日志
 
 训练循环调用：
 
-文件：`methods/3dgs/train_3dgs_curasao.py`
+文件：`methods/3dgs/train_3dgs_scene.py`
 
 ```python
 stats = densifier.update(model, render, optimizer, step)
@@ -963,7 +963,7 @@ opacity_reset
 
 训练脚本调用：
 
-文件：`methods/3dgs/train_3dgs_curasao.py`
+文件：`methods/3dgs/train_3dgs_scene.py`
 
 ```python
 psnr = compute_psnr(
@@ -983,7 +983,7 @@ def compute_psnr(pred: np.ndarray, target: np.ndarray, mask: Optional[np.ndarray
 
 测试集评估走本地辅助函数：
 
-文件：`methods/3dgs/train_3dgs_curasao.py`
+文件：`methods/3dgs/train_3dgs_scene.py`
 
 ```python
 @torch.no_grad()
@@ -1017,7 +1017,7 @@ test_cameras
 
 训练脚本调用：
 
-文件：`methods/3dgs/train_3dgs_curasao.py`
+文件：`methods/3dgs/train_3dgs_scene.py`
 
 ```python
 if step == 1 or step % args.save_every == 0 or step == args.iterations:
@@ -1029,7 +1029,7 @@ save_checkpoint(out_dir / "final.ply", model)
 
 本地辅助函数：
 
-文件：`methods/3dgs/train_3dgs_curasao.py`
+文件：`methods/3dgs/train_3dgs_scene.py`
 
 ```python
 def save_preview(path: Path, image: torch.Tensor) -> None:
@@ -1048,7 +1048,7 @@ def save_image(path: str, image: np.ndarray, quality: int = 95) -> None:
 
 保存 PLY 的辅助函数：
 
-文件：`methods/3dgs/train_3dgs_curasao.py`
+文件：`methods/3dgs/train_3dgs_scene.py`
 
 ```python
 def save_checkpoint(path: Path, model: GaussianModel) -> None:
@@ -1082,8 +1082,8 @@ def write_ply(path: str, data: Dict[str, np.ndarray]) -> None:
 GaussianModel raw tensors
   -> gaussians_to_ply_dict()
   -> write_ply()
-  -> outputs/curasao_3dgs/checkpoints/step_XXXXXX.ply
-  -> outputs/curasao_3dgs/final.ply
+  -> outputs/3dgs_scene/checkpoints/step_XXXXXX.ply
+  -> outputs/3dgs_scene/final.ply
 ```
 
 注意：这里的 `.ply` 是 3DGS Gaussian 参数 checkpoint，不是三角网格，也不是普通点云可视化文件。里面存的是：
@@ -1102,9 +1102,9 @@ rot_*
 先用很少迭代确认完整链路能跑通：
 
 ```bash
-python methods/3dgs/train_3dgs_curasao.py \
+python methods/3dgs/train_3dgs_scene.py \
   --data src/datasets/SeathruNeRF_dataset/Curasao \
-  --out outputs/curasao_smoke \
+  --out outputs/3dgs_smoke \
   --iterations 5 \
   --factor 8 \
   --save-every 5 \
@@ -1129,11 +1129,11 @@ load_colmap_dataset()
 输出应该至少包含：
 
 ```text
-outputs/curasao_smoke/previews/step_000001.png
-outputs/curasao_smoke/previews/step_000005.png
-outputs/curasao_smoke/checkpoints/step_000001.ply
-outputs/curasao_smoke/checkpoints/step_000005.ply
-outputs/curasao_smoke/final.ply
+outputs/3dgs_smoke/previews/step_000001.png
+outputs/3dgs_smoke/previews/step_000005.png
+outputs/3dgs_smoke/checkpoints/step_000001.ply
+outputs/3dgs_smoke/checkpoints/step_000005.ply
+outputs/3dgs_smoke/final.ply
 ```
 
 ## 17. 正式训练 Curasao
@@ -1141,9 +1141,9 @@ outputs/curasao_smoke/final.ply
 确认 smoke test 没问题后，跑正式训练：
 
 ```bash
-python methods/3dgs/train_3dgs_curasao.py \
+python methods/3dgs/train_3dgs_scene.py \
   --data src/datasets/SeathruNeRF_dataset/Curasao \
-  --out outputs/curasao_3dgs \
+  --out outputs/3dgs_scene \
   --iterations 7000 \
   --factor 4 \
   --densify-grad-threshold 2e-5 \
@@ -1224,7 +1224,7 @@ Gaussian 初始数量还不够大
 入口文件：
 
 ```text
-methods/3dgs/render_3dgs_curasao.py
+methods/3dgs/render_3dgs_views.py
 ```
 
 这个脚本适合回答：训练出来的 `final.ply` 在 Curasao 的真实相机上渲染得怎么样。
@@ -1252,9 +1252,9 @@ parse_args()
 运行：
 
 ```bash
-python methods/3dgs/render_3dgs_curasao.py \
-  --checkpoint outputs/curasao_3dgs/final.ply \
-  --out outputs/curasao_3dgs/renders_test \
+python methods/3dgs/render_3dgs_views.py \
+  --checkpoint outputs/3dgs_scene/final.ply \
+  --out outputs/3dgs_scene/renders_test \
   --split test \
   --factor 4
 ```
@@ -1262,16 +1262,16 @@ python methods/3dgs/render_3dgs_curasao.py \
 输出：
 
 ```text
-outputs/curasao_3dgs/renders_test/*_render.png
-outputs/curasao_3dgs/renders_test/*_gt.png
+outputs/3dgs_scene/renders_test/*_render.png
+outputs/3dgs_scene/renders_test/*_gt.png
 ```
 
 只看一张：
 
 ```bash
-python methods/3dgs/render_3dgs_curasao.py \
-  --checkpoint outputs/curasao_3dgs/final.ply \
-  --out outputs/curasao_3dgs/renders_one \
+python methods/3dgs/render_3dgs_views.py \
+  --checkpoint outputs/3dgs_scene/final.ply \
+  --out outputs/3dgs_scene/renders_one \
   --split test \
   --factor 4 \
   --max-images 1
@@ -1279,7 +1279,7 @@ python methods/3dgs/render_3dgs_curasao.py \
 
 关键函数说明：
 
-文件：`methods/3dgs/render_3dgs_curasao.py`
+文件：`methods/3dgs/render_3dgs_views.py`
 
 ```python
 def load_gaussian_checkpoint(path: Path, device: torch.device) -> GaussianModel:
@@ -1338,8 +1338,8 @@ parse_args()
 
 ```bash
 python methods/3dgs/render_3dgs_path.py \
-  --checkpoint outputs/curasao_3dgs/final.ply \
-  --out outputs/curasao_3dgs/path_interpolate \
+  --checkpoint outputs/3dgs_scene/final.ply \
+  --out outputs/3dgs_scene/path_interpolate \
   --mode interpolate \
   --split train \
   --factor 4 \
@@ -1352,8 +1352,8 @@ python methods/3dgs/render_3dgs_path.py \
 
 ```bash
 python methods/3dgs/render_3dgs_path.py \
-  --checkpoint outputs/curasao_3dgs/final.ply \
-  --out outputs/curasao_3dgs/path_orbit \
+  --checkpoint outputs/3dgs_scene/final.ply \
+  --out outputs/3dgs_scene/path_orbit \
   --mode orbit \
   --split train \
   --factor 4 \
@@ -1406,8 +1406,8 @@ def make_camera(scene, c2w: np.ndarray, device: torch.device, image_path: str) -
 输出：
 
 ```text
-outputs/curasao_3dgs/path_interpolate/frame_0000.png
-outputs/curasao_3dgs/path_interpolate/frame_0001.png
+outputs/3dgs_scene/path_interpolate/frame_0000.png
+outputs/3dgs_scene/path_interpolate/frame_0001.png
 ...
 ```
 
@@ -1418,7 +1418,7 @@ outputs/curasao_3dgs/path_interpolate/frame_0001.png
 ```text
 换数据读取方式
   -> utils/dataset_loaders.py
-  -> methods/3dgs/train_3dgs_curasao.py 里的 load_colmap_dataset() 调用
+  -> methods/3dgs/train_3dgs_scene.py 里的 load_colmap_dataset() 调用
 
 换相机定义或坐标系
   -> modules/camera.py
@@ -1436,11 +1436,11 @@ outputs/curasao_3dgs/path_interpolate/frame_0001.png
 
 换优化器学习率
   -> modules/optim.py 的 OptimConfig / build_3dgs_optimizer()
-  -> methods/3dgs/train_3dgs_curasao.py 里的 exponential_lr()
+  -> methods/3dgs/train_3dgs_scene.py 里的 exponential_lr()
 
 换 densification 策略
   -> modules/densification.py
-  -> methods/3dgs/train_3dgs_curasao.py 里的 DensificationConfig()
+  -> methods/3dgs/train_3dgs_scene.py 里的 DensificationConfig()
 
 换 checkpoint 格式
   -> utils/ply_io.py
@@ -1450,7 +1450,7 @@ outputs/curasao_3dgs/path_interpolate/frame_0001.png
   -> methods/3dgs/render_3dgs_path.py
 ```
 
-不要把这些逻辑都塞回 `train_3dgs_curasao.py`。训练脚本只负责组装和调度；数据、相机、模型、渲染、loss、optimizer、densification、PLY IO 都应该继续保持独立模块。
+不要把这些逻辑都塞回 `train_3dgs_scene.py`。训练脚本只负责组装和调度；数据、相机、模型、渲染、loss、optimizer、densification、PLY IO 都应该继续保持独立模块。
 
 ## 22. 最小闭环总结
 
@@ -1466,30 +1466,30 @@ utils.dataset_loaders.load_colmap_dataset()
   -> modules.densification.DensificationController.update()
   -> utils.ply_io.gaussians_to_ply_dict()
   -> utils.ply_io.write_ply()
-  -> methods/3dgs/render_3dgs_curasao.py 或 render_3dgs_path.py 查看结果
+  -> methods/3dgs/render_3dgs_views.py 或 render_3dgs_path.py 查看结果
 ```
 
 对应可执行命令：
 
 ```bash
-python methods/3dgs/train_3dgs_curasao.py \
+python methods/3dgs/train_3dgs_scene.py \
   --data src/datasets/SeathruNeRF_dataset/Curasao \
-  --out outputs/curasao_3dgs \
+  --out outputs/3dgs_scene \
   --iterations 7000 \
   --factor 4 \
   --densify-grad-threshold 2e-5 \
   --save-every 1000 \
   --log-every 50
 
-python methods/3dgs/render_3dgs_curasao.py \
-  --checkpoint outputs/curasao_3dgs/final.ply \
-  --out outputs/curasao_3dgs/renders_test \
+python methods/3dgs/render_3dgs_views.py \
+  --checkpoint outputs/3dgs_scene/final.ply \
+  --out outputs/3dgs_scene/renders_test \
   --split test \
   --factor 4
 
 python methods/3dgs/render_3dgs_path.py \
-  --checkpoint outputs/curasao_3dgs/final.ply \
-  --out outputs/curasao_3dgs/path_interpolate \
+  --checkpoint outputs/3dgs_scene/final.ply \
+  --out outputs/3dgs_scene/path_interpolate \
   --mode interpolate \
   --split train \
   --factor 4 \

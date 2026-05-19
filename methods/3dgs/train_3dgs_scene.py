@@ -1,4 +1,4 @@
-"""Minimal gsplat 3DGS training entrypoint for the Curasao scene."""
+"""Minimal gsplat 3DGS training entrypoint for a COLMAP scene."""
 
 from __future__ import annotations
 
@@ -34,9 +34,9 @@ from utils.ply_io import gaussians_to_ply_dict, write_ply
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train a minimal 3DGS model on Curasao.")
-    parser.add_argument("--data", default="src/datasets/SeathruNeRF_dataset/Curasao", help="Curasao scene directory.")
-    parser.add_argument("--out", default="outputs/curasao_3dgs", help="Output directory.")
+    parser = argparse.ArgumentParser(description="Train a minimal 3DGS model on a COLMAP scene.")
+    parser.add_argument("--data", default="src/datasets/SeathruNeRF_dataset/Curasao", help="COLMAP scene directory.")
+    parser.add_argument("--out", default="outputs/3dgs_scene", help="Output directory.")
     parser.add_argument("--iterations", type=int, default=7000, help="Training iterations.")
     parser.add_argument("--factor", type=int, default=4, help="Image downscale factor for training.")
     parser.add_argument("--holdout", type=int, default=8, help="Every Nth image is held out by the loader.")
