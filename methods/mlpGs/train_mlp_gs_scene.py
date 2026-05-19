@@ -6,6 +6,7 @@ import argparse
 import random
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -17,12 +18,14 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from gaussian_image_fusion import FusionCameraBatch, GaussianImageFusion
 from mlp_densification import MLPDensificationController
 from mlp_gaussian_model import MLPGaussianModel
-from modules import Camera, DensificationConfig, GaussianModel, GaussianRenderer, photometric_loss
+from modules import Camera, DensificationConfig, GaussianModel, GaussianRenderer, photometric_loss, ssim
 from utils.dataset_loaders import load_colmap_dataset
 from utils.image_utils import compute_psnr, save_image
 from utils.ply_io import gaussians_to_ply_dict, write_ply
+from vit_patch_memory import FrozenViTPatchExtractor, ViTPatchMemory
 
 
 def parse_args() -> argparse.Namespace:
@@ -37,6 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-every", type=int, default=1000, help="Save preview/checkpoint interval.")
     parser.add_argument("--log-every", type=int, default=50, help="Console log interval.")
     parser.add_argument("--eval-every", type=int, default=500, help="Evaluate held-out test views every N iterations; set 0 to disable.")
+    parser.add_argument("--eval-lpips", action="store_true", help="Also compute LPIPS during eval and save best_test_lpips checkpoints.")
     parser.add_argument("--seed", type=int, default=0, help="Random seed.")
     parser.add_argument("--mlp-hidden-dim", type=int, default=128, help="Hidden width of the Gaussian-parameter MLP.")
     parser.add_argument("--mlp-hidden-layers", type=int, default=3, help="Number of hidden layers in the MLP.")
@@ -46,6 +50,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--feature-init-std", type=float, default=0.01, help="Initial stddev for per-Gaussian features.")
     parser.add_argument("--feature-split-noise-std", type=float, default=0.01, help="Noise stddev added to split-child features.")
     parser.add_argument("--mlp-weight-decay", type=float, default=0.0, help="Adam weight decay for MLP parameters.")
+    parser.add_argument("--use-vit-memory", action="store_true", help="Condition anchors on frozen ViT patch memory from training views.")
+    parser.add_argument("--vit-weights", default="DEFAULT", help="torchvision ViT_B_16 weights name; use 'none' for random weights.")
+    parser.add_argument("--vit-batch-size", type=int, default=4, help="Batch size for precomputing frozen ViT patch tokens.")
+    parser.add_argument("--vit-topk-views", type=int, default=4, help="Top-K visible source views used by each Gaussian.")
+    parser.add_argument("--vit-patch-window", type=int, default=1, help="Patch window radius around each projected Gaussian.")
+    parser.add_argument("--fusion-dim", type=int, default=64, help="Hidden dimension for Gaussian-image cross-attention fusion.")
+    parser.add_argument("--fusion-heads", type=int, default=4, help="Attention heads for Gaussian-image fusion.")
+    parser.add_argument("--fusion-lr", type=float, default=1.0e-3, help="Adam learning rate for ViT-memory fusion parameters.")
+    parser.add_argument("--fusion-chunk-size", type=int, default=4096, help="Number of Gaussians fused per chunk.")
     parser.add_argument("--densify-grad-threshold", type=float, default=2.0e-5, help="Screen-space gradient threshold for clone/split.")
     parser.add_argument("--densify-from", type=int, default=500, help="Start MLP-GS densification at this step.")
     parser.add_argument("--densify-until", type=int, default=0, help="Stop densification at this step; 0 means iterations - 500.")
@@ -54,6 +67,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-opacity", type=float, default=0.005, help="Prune Gaussians with opacity below this threshold.")
     parser.add_argument("--max-screen-radius", type=float, default=0.0, help="Prune Gaussians larger than this screen radius; 0 disables it.")
     return parser.parse_args()
+
+
+@dataclass(frozen=True)
+class EvalMetrics:
+    psnr: float
+    ssim: float
+    l1: float
+    lpips: float | None = None
+
+
+@dataclass
+class ViTConditioner:
+    fusion: GaussianImageFusion
+    camera_batch: FusionCameraBatch
+    patch_memory: ViTPatchMemory
+    chunk_size: int
 
 
 def main() -> None:
@@ -93,7 +122,12 @@ def main() -> None:
         feature_split_noise_std=args.feature_split_noise_std,
     ).to(device)
     renderer = GaussianRenderer(background=(1.0, 1.0, 1.0))
-    optimizer = build_optimizer(model, args)
+    lpips_evaluator = LPIPSEvaluator(device) if args.eval_lpips else None
+
+    train_cameras = build_cameras(scene, device)
+    test_cameras = build_cameras(test_scene, device)
+    conditioner = build_vit_conditioner(args, train_cameras, model, device)
+    optimizer = build_optimizer(model, args, conditioner)
     densify_until = args.densify_until if args.densify_until > 0 else max(args.iterations - 500, args.densify_from + 1)
     densifier = MLPDensificationController(
         DensificationConfig(
@@ -109,14 +143,14 @@ def main() -> None:
         )
     )
 
-    train_cameras = build_cameras(scene, device)
-    test_cameras = build_cameras(test_scene, device)
     camera_indices = list(range(len(train_cameras)))
     viewpoint_stack: list[int] = []
 
     gpu_name = torch.cuda.get_device_name(device)
     total_mem_gb = torch.cuda.get_device_properties(device).total_memory / (1024**3)
-    trainable_params = sum(param.numel() for param in model.parameters() if param.requires_grad)
+    model_params = count_trainable_parameters(model)
+    fusion_params = count_trainable_parameters(conditioner.fusion) if conditioner is not None else 0
+    trainable_params = model_params + fusion_params
     print(f"设备：CUDA GPU='{gpu_name}' 显存={total_mem_gb:.2f}GB")
     print(f"数据集：{data_dir}")
     print(
@@ -128,6 +162,16 @@ def main() -> None:
         f"hidden_dim={args.mlp_hidden_dim}，hidden_layers={args.mlp_hidden_layers}，"
         f"feature_dim={args.feature_dim}，mlp_lr={args.mlp_lr:g}，feature_lr={args.feature_lr:g}"
     )
+    if conditioner is not None:
+        print(
+            f"ViT-memory：启用，source_views={conditioner.patch_memory.num_views}，"
+            f"patch={conditioner.patch_memory.grid_width}x{conditioner.patch_memory.grid_height}，"
+            f"token_dim={conditioner.patch_memory.token_dim}，topk={args.vit_topk_views}，"
+            f"window={(2 * args.vit_patch_window + 1)}x{(2 * args.vit_patch_window + 1)}，"
+            f"fusion_params={fusion_params:,}，fusion_lr={args.fusion_lr:g}"
+        )
+    else:
+        print("ViT-memory：未启用")
     print(
         f"致密化：{not args.disable_densification}，start={args.densify_from}，stop={densify_until}，"
         f"interval={args.densification_interval}，grad_threshold={args.densify_grad_threshold:g}，"
@@ -139,6 +183,14 @@ def main() -> None:
     started_at = time.perf_counter()
     best_loss = float("inf")
     best_loss_step = 0
+    best_test_psnr = float("-inf")
+    best_test_psnr_step = 0
+    best_test_ssim = float("-inf")
+    best_test_ssim_step = 0
+    best_test_l1 = float("inf")
+    best_test_l1_step = 0
+    best_test_lpips = float("inf")
+    best_test_lpips_step = 0
     progress = tqdm(range(1, args.iterations + 1), desc="MLP-GS 训练进度", unit="步", dynamic_ncols=True)
     for step in progress:
         step_started_at = time.perf_counter()
@@ -150,6 +202,7 @@ def main() -> None:
         gt_image = require_camera_image(camera)
 
         optimizer.zero_grad(set_to_none=True)
+        apply_vit_conditioning(model, conditioner, enable_grad=True)
         render = renderer.render(model, camera)
         loss, parts = photometric_loss(render.image.clamp(0.0, 1.0), gt_image, lambda_dssim=args.lambda_dssim)
         loss.backward()
@@ -158,6 +211,7 @@ def main() -> None:
         stats = None
         if not args.disable_densification:
             previous_anchor_features = model.anchor_features
+            apply_vit_conditioning(model, conditioner, enable_grad=False)
             stats = densifier.update(model, render, step)
             sync_anchor_feature_optimizer(optimizer, previous_anchor_features, model.anchor_features)
 
@@ -166,11 +220,12 @@ def main() -> None:
             best_loss = current_loss
             best_loss_step = step
             save_preview(out_dir / "best_loss.png", render.image)
-            save_ply_checkpoint(out_dir / "best_loss.ply", model)
+            save_ply_checkpoint(out_dir / "best_loss.ply", model, conditioner)
             save_mlp_checkpoint(
                 out_dir / "best_loss_mlp.pt",
                 model,
                 args,
+                conditioner,
                 extra={
                     "best_loss": best_loss,
                     "best_loss_step": best_loss_step,
@@ -207,19 +262,54 @@ def main() -> None:
             )
 
         if args.eval_every > 0 and (step == 1 or step % args.eval_every == 0 or step == args.iterations):
-            eval_psnr = evaluate_psnr(model, renderer, test_cameras)
-            tqdm.write(f"测试评估 | 第 {step:06d} 步 | 测试图像={len(test_cameras)} | 测试PSNR={eval_psnr:.2f}")
+            eval_metrics = evaluate_metrics(model, renderer, test_cameras, lpips_evaluator, conditioner)
+            lpips_text = f" | 测试LPIPS={eval_metrics.lpips:.4f}" if eval_metrics.lpips is not None else ""
+            tqdm.write(
+                f"测试评估 | 第 {step:06d} 步 | 测试图像={len(test_cameras)} | "
+                f"测试PSNR={eval_metrics.psnr:.2f} | 测试SSIM={eval_metrics.ssim:.4f} | "
+                f"测试L1={eval_metrics.l1:.5f}{lpips_text}"
+            )
+            if is_finite(eval_metrics.psnr) and eval_metrics.psnr > best_test_psnr:
+                best_test_psnr = eval_metrics.psnr
+                best_test_psnr_step = step
+                save_eval_checkpoint(out_dir, "best_test_psnr", model, args, step, eval_metrics, conditioner)
+                tqdm.write(f"保存 best_test_psnr | 第 {step:06d} 步 | PSNR={best_test_psnr:.2f}")
+            if is_finite(eval_metrics.ssim) and eval_metrics.ssim > best_test_ssim:
+                best_test_ssim = eval_metrics.ssim
+                best_test_ssim_step = step
+                save_eval_checkpoint(out_dir, "best_test_ssim", model, args, step, eval_metrics, conditioner)
+                tqdm.write(f"保存 best_test_ssim | 第 {step:06d} 步 | SSIM={best_test_ssim:.4f}")
+            if is_finite(eval_metrics.l1) and eval_metrics.l1 < best_test_l1:
+                best_test_l1 = eval_metrics.l1
+                best_test_l1_step = step
+                save_eval_checkpoint(out_dir, "best_test_l1", model, args, step, eval_metrics, conditioner)
+                tqdm.write(f"保存 best_test_l1 | 第 {step:06d} 步 | L1={best_test_l1:.5f}")
+            if eval_metrics.lpips is not None and is_finite(eval_metrics.lpips) and eval_metrics.lpips < best_test_lpips:
+                best_test_lpips = eval_metrics.lpips
+                best_test_lpips_step = step
+                save_eval_checkpoint(out_dir, "best_test_lpips", model, args, step, eval_metrics, conditioner)
+                tqdm.write(f"保存 best_test_lpips | 第 {step:06d} 步 | LPIPS={best_test_lpips:.4f}")
 
         if step == 1 or step % args.save_every == 0 or step == args.iterations:
             save_preview(preview_dir / f"step_{step:06d}.png", render.image)
-            save_ply_checkpoint(checkpoint_dir / f"step_{step:06d}.ply", model)
+            save_ply_checkpoint(checkpoint_dir / f"step_{step:06d}.ply", model, conditioner)
 
-    save_ply_checkpoint(out_dir / "final.ply", model)
-    save_mlp_checkpoint(out_dir / "final_mlp.pt", model, args)
+    save_ply_checkpoint(out_dir / "final.ply", model, conditioner)
+    save_mlp_checkpoint(out_dir / "final_mlp.pt", model, args, conditioner)
+    best_eval_text = ""
+    if best_test_psnr_step > 0:
+        best_eval_text = (
+            f"，best_test_psnr.ply={out_dir / 'best_test_psnr.ply'}，"
+            f"best_test_psnr={best_test_psnr:.2f}@step={best_test_psnr_step}，"
+            f"best_test_ssim={best_test_ssim:.4f}@step={best_test_ssim_step}，"
+            f"best_test_l1={best_test_l1:.5f}@step={best_test_l1_step}"
+        )
+        if best_test_lpips_step > 0:
+            best_eval_text += f"，best_test_lpips={best_test_lpips:.4f}@step={best_test_lpips_step}"
     print(
         f"训练完成：final.ply={out_dir / 'final.ply'}，final_mlp.pt={out_dir / 'final_mlp.pt'}，"
         f"best_loss.ply={out_dir / 'best_loss.ply'}，best_loss={best_loss:.6f}@step={best_loss_step}，"
-        f"总耗时 {format_duration(time.perf_counter() - started_at)}"
+        f"总耗时 {format_duration(time.perf_counter() - started_at)}{best_eval_text}"
     )
 
 
@@ -235,13 +325,70 @@ def require_camera_image(camera: Camera) -> Tensor:
     return camera.image
 
 
-def build_optimizer(model: MLPGaussianModel, args: argparse.Namespace) -> torch.optim.Adam:
+def build_vit_conditioner(
+    args: argparse.Namespace,
+    train_cameras: list[Camera],
+    model: MLPGaussianModel,
+    device: torch.device,
+) -> ViTConditioner | None:
+    """Build frozen ViT patch memory and the trainable fusion module."""
+    if not args.use_vit_memory:
+        return None
+    if model.feature_dim <= 0:
+        raise ValueError("--use-vit-memory 需要 --feature-dim > 0")
+
+    print("ViT-memory：开始提取训练图 patch tokens（ViT 主干冻结）...")
+    extractor = FrozenViTPatchExtractor(weights=args.vit_weights, device=device)
+    patch_memory = extractor.build_memory(train_cameras, batch_size=args.vit_batch_size)
+    del extractor
+    torch.cuda.empty_cache()
+
+    camera_batch = FusionCameraBatch.from_cameras(train_cameras, device=device)
+    fusion = GaussianImageFusion(
+        anchor_feature_dim=model.feature_dim,
+        vit_token_dim=patch_memory.token_dim,
+        fusion_dim=args.fusion_dim,
+        num_heads=args.fusion_heads,
+        topk_views=args.vit_topk_views,
+        patch_window=args.vit_patch_window,
+    ).to(device)
+    return ViTConditioner(
+        fusion=fusion,
+        camera_batch=camera_batch,
+        patch_memory=patch_memory,
+        chunk_size=args.fusion_chunk_size,
+    )
+
+
+def apply_vit_conditioning(model: MLPGaussianModel, conditioner: ViTConditioner | None, enable_grad: bool) -> None:
+    """Set current fused anchor features on the MLP-GS model."""
+    if conditioner is None:
+        model.clear_conditioned_anchor_features()
+        return
+    with torch.set_grad_enabled(enable_grad):
+        conditioned_features = conditioner.fusion(
+            model.anchor_xyz,
+            model.normalized_inputs_for(model.anchor_xyz),
+            model.anchor_features,
+            conditioner.camera_batch,
+            conditioner.patch_memory,
+            chunk_size=conditioner.chunk_size,
+        )
+    model.set_conditioned_anchor_features(conditioned_features)
+
+
+def build_optimizer(model: MLPGaussianModel, args: argparse.Namespace, conditioner: ViTConditioner | None) -> torch.optim.Adam:
     """Build Adam for shared MLP weights plus per-Gaussian learnable features."""
+    param_groups = [
+        {"params": list(model.mlp.parameters()), "lr": args.mlp_lr, "weight_decay": args.mlp_weight_decay, "name": "mlp"},
+        {"params": [model.anchor_features], "lr": args.feature_lr, "weight_decay": 0.0, "name": "anchor_features"},
+    ]
+    if conditioner is not None:
+        param_groups.append(
+            {"params": list(conditioner.fusion.parameters()), "lr": args.fusion_lr, "weight_decay": 0.0, "name": "image_fusion"}
+        )
     return torch.optim.Adam(
-        [
-            {"params": list(model.mlp.parameters()), "lr": args.mlp_lr, "weight_decay": args.mlp_weight_decay, "name": "mlp"},
-            {"params": [model.anchor_features], "lr": args.feature_lr, "weight_decay": 0.0, "name": "anchor_features"},
-        ],
+        param_groups,
         eps=1.0e-15,
     )
 
@@ -263,14 +410,19 @@ def sync_anchor_feature_optimizer(
     raise RuntimeError("optimizer is missing the anchor_features parameter group")
 
 
+def count_trainable_parameters(module: torch.nn.Module) -> int:
+    return sum(param.numel() for param in module.parameters() if param.requires_grad)
+
+
 def save_preview(path: Path, image: Tensor) -> None:
     """Save a rendered CHW tensor as an RGB preview image."""
     array = image.detach().clamp(0.0, 1.0).permute(1, 2, 0).cpu().numpy()
     save_image(str(path), array)
 
 
-def save_ply_checkpoint(path: Path, model: MLPGaussianModel) -> None:
+def save_ply_checkpoint(path: Path, model: MLPGaussianModel, conditioner: ViTConditioner | None = None) -> None:
     """Bake the current MLP-predicted Gaussian parameters into a 3DGS PLY."""
+    apply_vit_conditioning(model, conditioner, enable_grad=False)
     with torch.no_grad():
         raw = model.export_tensors()
         data = gaussians_to_ply_dict(
@@ -284,13 +436,33 @@ def save_ply_checkpoint(path: Path, model: MLPGaussianModel) -> None:
     write_ply(str(path), data)
 
 
-def save_mlp_checkpoint(path: Path, model: MLPGaussianModel, args: argparse.Namespace, extra: dict | None = None) -> None:
+def save_mlp_checkpoint(
+    path: Path,
+    model: MLPGaussianModel,
+    args: argparse.Namespace,
+    conditioner: ViTConditioner | None = None,
+    extra: dict | None = None,
+) -> None:
     """Save the MLP weights plus fixed anchors/base tensors for future reuse."""
     path.parent.mkdir(parents=True, exist_ok=True)
     payload_extra = {
         "args": vars(args),
-        "checkpoint_format": "mlpGs.v1",
+        "checkpoint_format": "mlpGs.vit_memory.v1" if conditioner is not None else "mlpGs.v1",
     }
+    if conditioner is not None:
+        payload_extra.update(
+            {
+                "fusion_state_dict": conditioner.fusion.state_dict(),
+                "fusion_config": {
+                    "fusion_dim": conditioner.fusion.fusion_dim,
+                    "fusion_heads": conditioner.fusion.num_heads,
+                    "vit_topk_views": conditioner.fusion.topk_views,
+                    "vit_patch_window": conditioner.fusion.patch_window,
+                    "fusion_chunk_size": conditioner.chunk_size,
+                },
+                "vit_memory": conditioner.patch_memory.metadata(),
+            }
+        )
     if extra:
         payload_extra.update(extra)
     torch.save(
@@ -299,20 +471,88 @@ def save_mlp_checkpoint(path: Path, model: MLPGaussianModel, args: argparse.Name
     )
 
 
+def save_eval_checkpoint(
+    out_dir: Path,
+    name: str,
+    model: MLPGaussianModel,
+    args: argparse.Namespace,
+    step: int,
+    metrics: EvalMetrics,
+    conditioner: ViTConditioner | None = None,
+) -> None:
+    """Save the baked PLY and resumable MLP checkpoint for a best eval metric."""
+    save_ply_checkpoint(out_dir / f"{name}.ply", model, conditioner)
+    save_mlp_checkpoint(
+        out_dir / f"{name}_mlp.pt",
+        model,
+        args,
+        conditioner,
+        extra={
+            "best_eval_name": name,
+            "best_eval_step": step,
+            "eval_psnr": metrics.psnr,
+            "eval_ssim": metrics.ssim,
+            "eval_l1": metrics.l1,
+            "eval_lpips": metrics.lpips,
+        },
+    )
+
+
 @torch.no_grad()
-def evaluate_psnr(model: MLPGaussianModel, renderer: GaussianRenderer, cameras: list[Camera]) -> float:
-    """Render held-out cameras and return their mean PSNR."""
-    values = []
+def evaluate_metrics(
+    model: MLPGaussianModel,
+    renderer: GaussianRenderer,
+    cameras: list[Camera],
+    lpips_evaluator: "LPIPSEvaluator | None" = None,
+    conditioner: ViTConditioner | None = None,
+) -> EvalMetrics:
+    """Render held-out cameras and return mean test metrics."""
+    apply_vit_conditioning(model, conditioner, enable_grad=False)
+    psnr_values = []
+    ssim_values = []
+    l1_values = []
+    lpips_values = []
     for camera in cameras:
         gt_image = require_camera_image(camera)
         render = renderer.render(model, camera)
-        values.append(
+        image = render.image.detach().clamp(0.0, 1.0)
+        psnr_values.append(
             compute_psnr(
-                render.image.detach().clamp(0.0, 1.0).permute(1, 2, 0).cpu().numpy(),
+                image.permute(1, 2, 0).cpu().numpy(),
                 gt_image.detach().permute(1, 2, 0).cpu().numpy(),
             )
         )
-    return float(np.mean(values)) if values else float("nan")
+        ssim_values.append(float(ssim(image, gt_image).detach()))
+        l1_values.append(float(torch.mean(torch.abs(image - gt_image)).detach()))
+        if lpips_evaluator is not None:
+            lpips_values.append(lpips_evaluator(image, gt_image))
+    return EvalMetrics(
+        psnr=float(np.mean(psnr_values)) if psnr_values else float("nan"),
+        ssim=float(np.mean(ssim_values)) if ssim_values else float("nan"),
+        l1=float(np.mean(l1_values)) if l1_values else float("nan"),
+        lpips=float(np.mean(lpips_values)) if lpips_values else None,
+    )
+
+
+class LPIPSEvaluator:
+    """Optional LPIPS wrapper used only when --eval-lpips is enabled."""
+
+    def __init__(self, device: torch.device) -> None:
+        try:
+            import lpips
+        except ImportError as exc:
+            raise ImportError("计算 eval LPIPS 需要安装 lpips：pip install lpips") from exc
+        self.model = lpips.LPIPS(net="vgg").to(device).eval()
+
+    @torch.no_grad()
+    def __call__(self, image: Tensor, gt: Tensor) -> float:
+        image_bchw = image.unsqueeze(0) * 2.0 - 1.0
+        gt_bchw = gt.unsqueeze(0) * 2.0 - 1.0
+        return float(self.model(image_bchw, gt_bchw).detach().reshape(-1)[0])
+
+
+def is_finite(value: float) -> bool:
+    return bool(np.isfinite(value))
 
 
 def format_duration(seconds: float) -> str:

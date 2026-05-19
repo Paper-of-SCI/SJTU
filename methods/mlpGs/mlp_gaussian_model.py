@@ -81,6 +81,7 @@ class MLPGaussianModel(nn.Module):
         self.register_buffer("base_features_rest", base_tensors.features_rest.detach().clone())
         self.register_buffer("gradient_accum", torch.zeros(anchor_xyz.shape[0], device=anchor_xyz.device))
         self.register_buffer("gradient_count", torch.zeros(anchor_xyz.shape[0], device=anchor_xyz.device))
+        self._conditioned_anchor_features: Tensor | None = None
 
         self.mlp = self._build_mlp(
             input_dim=3 + self.feature_dim,
@@ -168,9 +169,31 @@ class MLPGaussianModel(nn.Module):
         raw = self.raw_tensors()
         return torch.cat([raw.features_dc, raw.features_rest], dim=1)
 
-    def raw_tensors(self) -> RawGaussianTensors:
+    def set_conditioned_anchor_features(self, anchor_features: Tensor | None) -> None:
+        """Temporarily use externally fused anchor features for prediction."""
+        if anchor_features is None:
+            self._conditioned_anchor_features = None
+            return
+        if anchor_features.shape != self.anchor_features.shape:
+            raise ValueError(
+                f"conditioned anchor feature shape {tuple(anchor_features.shape)} "
+                f"does not match {tuple(self.anchor_features.shape)}"
+            )
+        self._conditioned_anchor_features = anchor_features
+
+    def clear_conditioned_anchor_features(self) -> None:
+        self._conditioned_anchor_features = None
+
+    def current_anchor_features(self) -> Tensor:
+        """Return fused features when active, otherwise the learnable features."""
+        if self._conditioned_anchor_features is not None:
+            return self._conditioned_anchor_features
+        return self.anchor_features
+
+    def raw_tensors(self, conditioned_anchor_features: Tensor | None = None) -> RawGaussianTensors:
         """Return the current raw Gaussian tensors predicted by the MLP."""
-        deltas = self._predict_deltas(self.anchor_xyz)
+        anchor_features = self.current_anchor_features() if conditioned_anchor_features is None else conditioned_anchor_features
+        deltas = self._predict_deltas(self.anchor_xyz, anchor_features)
         return RawGaussianTensors(
             means=self.base_means + deltas.means,
             log_scales=self.base_log_scales + deltas.log_scales,
@@ -180,9 +203,9 @@ class MLPGaussianModel(nn.Module):
             features_rest=self.base_features_rest + deltas.features_rest,
         )
 
-    def activated_tensors(self) -> GaussianTensors:
+    def activated_tensors(self, conditioned_anchor_features: Tensor | None = None) -> GaussianTensors:
         """Return activated tensors expected by ``gsplat.rasterization``."""
-        raw = self.raw_tensors()
+        raw = self.raw_tensors(conditioned_anchor_features)
         return GaussianTensors(
             means=raw.means,
             scales=raw.log_scales.exp(),
@@ -191,9 +214,9 @@ class MLPGaussianModel(nn.Module):
             colors=torch.cat([raw.features_dc, raw.features_rest], dim=1),
         )
 
-    def export_tensors(self) -> RawGaussianTensors:
+    def export_tensors(self, conditioned_anchor_features: Tensor | None = None) -> RawGaussianTensors:
         """Return detached raw tensors suitable for PLY checkpoint writing."""
-        raw = self.raw_tensors()
+        raw = self.raw_tensors(conditioned_anchor_features)
         return RawGaussianTensors(
             means=raw.means.detach(),
             log_scales=raw.log_scales.detach(),
@@ -445,6 +468,7 @@ class MLPGaussianModel(nn.Module):
     def _replace_gaussian_buffers(self, anchor_xyz: Tensor, anchor_features: Tensor, base_tensors: RawGaussianTensors) -> None:
         self.anchor_xyz = anchor_xyz.detach().clone()
         self.anchor_features = nn.Parameter(anchor_features.detach().clone())
+        self._conditioned_anchor_features = None
         self.base_means = base_tensors.means.detach().clone()
         self.base_log_scales = base_tensors.log_scales.detach().clone()
         self.base_quats = base_tensors.quats.detach().clone()
