@@ -18,6 +18,16 @@ from torch import Tensor
 from modules.gaussian_model import GaussianModel, GaussianTensors, quats_to_rotmats
 from modules.spherical_harmonics import num_sh_bases
 
+RESIZABLE_PARAMETER_NAMES = (
+    "anchor_features",
+    "base_means",
+    "base_log_scales",
+    "base_quats",
+    "base_logit_opacities",
+    "base_features_dc",
+    "base_features_rest",
+)
+
 
 @dataclass(frozen=True)
 class RawGaussianTensors:
@@ -48,6 +58,7 @@ class MLPGaussianModel(nn.Module):
         feature_dim: int = 32,
         feature_init_std: float = 0.01,
         feature_split_noise_std: float = 0.01,
+        train_base: bool = True,
     ) -> None:
         super().__init__()
         if anchor_xyz.ndim != 2 or anchor_xyz.shape[-1] != 3:
@@ -65,6 +76,7 @@ class MLPGaussianModel(nn.Module):
         self.feature_dim = int(feature_dim)
         self.feature_init_std = float(feature_init_std)
         self.feature_split_noise_std = float(feature_split_noise_std)
+        self.train_base = bool(train_base)
         self.rest_bases = max(num_sh_bases(self.sh_degree) - 1, 0)
 
         self.register_buffer("anchor_xyz", anchor_xyz.detach().clone())
@@ -73,12 +85,7 @@ class MLPGaussianModel(nn.Module):
         self.register_buffer("input_scale", input_scale)
         self.anchor_features = nn.Parameter(self._initial_anchor_features(anchor_xyz.shape[0], anchor_xyz.device, anchor_xyz.dtype))
 
-        self.register_buffer("base_means", base_tensors.means.detach().clone())
-        self.register_buffer("base_log_scales", base_tensors.log_scales.detach().clone())
-        self.register_buffer("base_quats", base_tensors.quats.detach().clone())
-        self.register_buffer("base_logit_opacities", base_tensors.logit_opacities.detach().clone())
-        self.register_buffer("base_features_dc", base_tensors.features_dc.detach().clone())
-        self.register_buffer("base_features_rest", base_tensors.features_rest.detach().clone())
+        self._set_base_tensors(base_tensors)
         self.register_buffer("gradient_accum", torch.zeros(anchor_xyz.shape[0], device=anchor_xyz.device))
         self.register_buffer("gradient_count", torch.zeros(anchor_xyz.shape[0], device=anchor_xyz.device))
         self._conditioned_anchor_features: Tensor | None = None
@@ -99,6 +106,7 @@ class MLPGaussianModel(nn.Module):
         feature_dim: int = 32,
         feature_init_std: float = 0.01,
         feature_split_noise_std: float = 0.01,
+        train_base: bool = True,
     ) -> "MLPGaussianModel":
         """Create an MLP-GS model from the standard point-cloud initialization."""
         base_tensors = RawGaussianTensors(
@@ -118,6 +126,7 @@ class MLPGaussianModel(nn.Module):
             feature_dim=feature_dim,
             feature_init_std=feature_init_std,
             feature_split_noise_std=feature_split_noise_std,
+            train_base=train_base,
         )
 
     @property
@@ -236,6 +245,7 @@ class MLPGaussianModel(nn.Module):
             "feature_dim": self.feature_dim,
             "feature_init_std": self.feature_init_std,
             "feature_split_noise_std": self.feature_split_noise_std,
+            "train_base": self.train_base,
             "num_gaussians": self.num_gaussians,
             "raw_output_dim": self.raw_output_dim,
         }
@@ -288,6 +298,13 @@ class MLPGaussianModel(nn.Module):
     def clear_gradient_stats(self) -> None:
         self.gradient_accum.zero_()
         self.gradient_count.zero_()
+
+    def resizable_parameter_map(self) -> Dict[str, nn.Parameter]:
+        """Return optimizer-managed per-Gaussian tensors that resize on densification."""
+        params = {"anchor_features": self.anchor_features}
+        if self.train_base:
+            params.update({name: getattr(self, name) for name in RESIZABLE_PARAMETER_NAMES[1:]})
+        return params
 
     def clone(self, mask: Tensor) -> int:
         """Append one new MLP input anchor for each selected Gaussian."""
@@ -346,7 +363,7 @@ class MLPGaussianModel(nn.Module):
         keep = ~remove_mask
         if bool(keep.all()):
             return keep
-        self._replace_gaussian_buffers(
+        self._replace_gaussian_tensors(
             anchor_xyz=self.anchor_xyz.detach()[keep],
             anchor_features=self.anchor_features.detach()[keep],
             base_tensors=RawGaussianTensors(
@@ -365,7 +382,9 @@ class MLPGaussianModel(nn.Module):
         value = float(min(max(value, 1.0e-4), 1.0 - 1.0e-4))
         logit = math.log(value / (1.0 - value))
         deltas = self._predict_deltas(self.anchor_xyz)
-        self.base_logit_opacities = self.base_logit_opacities.new_full((self.num_gaussians, 1), logit) - deltas.logit_opacities.detach()
+        reset_logits = self.base_logit_opacities.new_full((self.num_gaussians, 1), logit) - deltas.logit_opacities.detach()
+        with torch.no_grad():
+            self.base_logit_opacities.copy_(reset_logits)
 
     def append_gaussians(self, anchor_xyz: Tensor, target_tensors: RawGaussianTensors, anchor_features: Tensor | None = None) -> int:
         """Append new anchors whose first forward pass equals ``target_tensors``."""
@@ -389,7 +408,7 @@ class MLPGaussianModel(nn.Module):
         anchor_features = anchor_features.to(device=self.anchor_xyz.device, dtype=self.anchor_xyz.dtype).detach()
         target_tensors = _raw_to(target_tensors, device=self.anchor_xyz.device, dtype=self.anchor_xyz.dtype)
         base_new = self._base_tensors_for_targets(anchor_xyz, anchor_features, target_tensors)
-        self._replace_gaussian_buffers(
+        self._replace_gaussian_tensors(
             anchor_xyz=torch.cat([self.anchor_xyz.detach(), anchor_xyz], dim=0),
             anchor_features=torch.cat([self.anchor_features.detach(), anchor_features], dim=0),
             base_tensors=RawGaussianTensors(
@@ -465,17 +484,31 @@ class MLPGaussianModel(nn.Module):
             features_rest=target_tensors.features_rest.detach() - deltas.features_rest.detach(),
         )
 
-    def _replace_gaussian_buffers(self, anchor_xyz: Tensor, anchor_features: Tensor, base_tensors: RawGaussianTensors) -> None:
+    def _replace_gaussian_tensors(self, anchor_xyz: Tensor, anchor_features: Tensor, base_tensors: RawGaussianTensors) -> None:
         self.anchor_xyz = anchor_xyz.detach().clone()
         self.anchor_features = nn.Parameter(anchor_features.detach().clone())
         self._conditioned_anchor_features = None
-        self.base_means = base_tensors.means.detach().clone()
-        self.base_log_scales = base_tensors.log_scales.detach().clone()
-        self.base_quats = base_tensors.quats.detach().clone()
-        self.base_logit_opacities = base_tensors.logit_opacities.detach().clone()
-        self.base_features_dc = base_tensors.features_dc.detach().clone()
-        self.base_features_rest = base_tensors.features_rest.detach().clone()
+        self._set_base_tensors(base_tensors)
         self._reset_gradient_buffers(self.num_gaussians, self.anchor_xyz.device)
+
+    def _set_base_tensors(self, base_tensors: RawGaussianTensors) -> None:
+        self._set_base_tensor("base_means", base_tensors.means)
+        self._set_base_tensor("base_log_scales", base_tensors.log_scales)
+        self._set_base_tensor("base_quats", base_tensors.quats)
+        self._set_base_tensor("base_logit_opacities", base_tensors.logit_opacities)
+        self._set_base_tensor("base_features_dc", base_tensors.features_dc)
+        self._set_base_tensor("base_features_rest", base_tensors.features_rest)
+
+    def _set_base_tensor(self, name: str, value: Tensor) -> None:
+        tensor = value.detach().clone()
+        if name in self._parameters:
+            del self._parameters[name]
+        if name in self._buffers:
+            del self._buffers[name]
+        if self.train_base:
+            self.register_parameter(name, nn.Parameter(tensor))
+        else:
+            self.register_buffer(name, tensor)
 
     def _reset_gradient_buffers(self, count: int, device: torch.device) -> None:
         self.gradient_accum = torch.zeros(count, device=device)

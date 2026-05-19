@@ -21,7 +21,16 @@ if str(ROOT) not in sys.path:
 from gaussian_image_fusion import FusionCameraBatch, GaussianImageFusion
 from mlp_densification import MLPDensificationController
 from mlp_gaussian_model import MLPGaussianModel
-from modules import Camera, DensificationConfig, GaussianModel, GaussianRenderer, photometric_loss, ssim
+from modules import (
+    Camera,
+    DensificationConfig,
+    GaussianModel,
+    GaussianRenderer,
+    exponential_lr,
+    photometric_loss,
+    set_group_lr,
+    ssim,
+)
 from utils.dataset_loaders import load_colmap_dataset
 from utils.image_utils import compute_psnr, save_image
 from utils.ply_io import gaussians_to_ply_dict, write_ply
@@ -50,6 +59,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--feature-init-std", type=float, default=0.01, help="Initial stddev for per-Gaussian features.")
     parser.add_argument("--feature-split-noise-std", type=float, default=0.01, help="Noise stddev added to split-child features.")
     parser.add_argument("--mlp-weight-decay", type=float, default=0.0, help="Adam weight decay for MLP parameters.")
+    parser.add_argument("--freeze-gaussian-base", action="store_true", help="Freeze direct Gaussian raw tensors and reproduce the older pure-MLP residual mode.")
+    parser.add_argument("--position-lr-init", type=float, default=1.6e-4, help="Initial LR for trainable Gaussian base means.")
+    parser.add_argument("--position-lr-final", type=float, default=1.6e-6, help="Final LR for trainable Gaussian base means.")
+    parser.add_argument("--position-lr-delay-steps", type=int, default=1000, help="Delay steps for trainable Gaussian base means LR.")
+    parser.add_argument("--position-lr-delay-mult", type=float, default=0.01, help="Delay multiplier for trainable Gaussian base means LR.")
+    parser.add_argument("--base-feature-lr", type=float, default=2.5e-3, help="LR for trainable Gaussian base DC SH features.")
+    parser.add_argument("--base-feature-rest-lr-scale", type=float, default=0.05, help="LR multiplier for trainable non-DC SH features.")
+    parser.add_argument("--base-opacity-lr", type=float, default=5.0e-2, help="LR for trainable Gaussian base opacities.")
+    parser.add_argument("--base-scaling-lr", type=float, default=5.0e-3, help="LR for trainable Gaussian base scales.")
+    parser.add_argument("--base-rotation-lr", type=float, default=1.0e-3, help="LR for trainable Gaussian base rotations.")
     parser.add_argument("--use-vit-memory", action="store_true", help="Condition anchors on frozen ViT patch memory from training views.")
     parser.add_argument("--vit-weights", default="DEFAULT", help="torchvision ViT_B_16 weights name; use 'none' for random weights.")
     parser.add_argument("--vit-batch-size", type=int, default=4, help="Batch size for precomputing frozen ViT patch tokens.")
@@ -120,6 +139,7 @@ def main() -> None:
         feature_dim=args.feature_dim,
         feature_init_std=args.feature_init_std,
         feature_split_noise_std=args.feature_split_noise_std,
+        train_base=not args.freeze_gaussian_base,
     ).to(device)
     renderer = GaussianRenderer(background=(1.0, 1.0, 1.0))
     lpips_evaluator = LPIPSEvaluator(device) if args.eval_lpips else None
@@ -128,6 +148,13 @@ def main() -> None:
     test_cameras = build_cameras(test_scene, device)
     conditioner = build_vit_conditioner(args, train_cameras, model, device)
     optimizer = build_optimizer(model, args, conditioner)
+    position_lr = exponential_lr(
+        args.position_lr_init,
+        args.position_lr_final,
+        max_steps=args.iterations,
+        delay_steps=args.position_lr_delay_steps,
+        delay_mult=args.position_lr_delay_mult,
+    )
     densify_until = args.densify_until if args.densify_until > 0 else max(args.iterations - 500, args.densify_from + 1)
     densifier = MLPDensificationController(
         DensificationConfig(
@@ -158,9 +185,15 @@ def main() -> None:
         f"holdout={args.holdout}，分辨率={scene.width}x{scene.height}，降采样 factor={args.factor}"
     )
     print(
-        f"MLP-GS：初始 Gaussian 数量={model.num_gaussians}，MLP 参数量={trainable_params:,}，"
+        f"MLP-GS：初始 Gaussian 数量={model.num_gaussians}，可训练参数量={trainable_params:,}，"
         f"hidden_dim={args.mlp_hidden_dim}，hidden_layers={args.mlp_hidden_layers}，"
         f"feature_dim={args.feature_dim}，mlp_lr={args.mlp_lr:g}，feature_lr={args.feature_lr:g}"
+    )
+    print(
+        f"Gaussian base：{'可训练' if model.train_base else '冻结'}，"
+        f"position_lr={args.position_lr_init:g}->{args.position_lr_final:g}，"
+        f"base_feature_lr={args.base_feature_lr:g}，opacity_lr={args.base_opacity_lr:g}，"
+        f"scaling_lr={args.base_scaling_lr:g}，rotation_lr={args.base_rotation_lr:g}"
     )
     if conditioner is not None:
         print(
@@ -202,6 +235,8 @@ def main() -> None:
         gt_image = require_camera_image(camera)
 
         optimizer.zero_grad(set_to_none=True)
+        if model.train_base:
+            set_group_lr(optimizer, "base_means", position_lr(step))
         apply_vit_conditioning(model, conditioner, enable_grad=True)
         render = renderer.render(model, camera)
         loss, parts = photometric_loss(render.image.clamp(0.0, 1.0), gt_image, lambda_dssim=args.lambda_dssim)
@@ -210,10 +245,8 @@ def main() -> None:
 
         stats = None
         if not args.disable_densification:
-            previous_anchor_features = model.anchor_features
             apply_vit_conditioning(model, conditioner, enable_grad=False)
-            stats = densifier.update(model, render, step)
-            sync_anchor_feature_optimizer(optimizer, previous_anchor_features, model.anchor_features)
+            stats = densifier.update(model, render, optimizer, step)
 
         current_loss = float(loss.detach())
         if current_loss < best_loss:
@@ -383,6 +416,22 @@ def build_optimizer(model: MLPGaussianModel, args: argparse.Namespace, condition
         {"params": list(model.mlp.parameters()), "lr": args.mlp_lr, "weight_decay": args.mlp_weight_decay, "name": "mlp"},
         {"params": [model.anchor_features], "lr": args.feature_lr, "weight_decay": 0.0, "name": "anchor_features"},
     ]
+    if model.train_base:
+        param_groups.extend(
+            [
+                {"params": [model.base_means], "lr": args.position_lr_init, "weight_decay": 0.0, "name": "base_means"},
+                {"params": [model.base_features_dc], "lr": args.base_feature_lr, "weight_decay": 0.0, "name": "base_features_dc"},
+                {
+                    "params": [model.base_features_rest],
+                    "lr": args.base_feature_lr * args.base_feature_rest_lr_scale,
+                    "weight_decay": 0.0,
+                    "name": "base_features_rest",
+                },
+                {"params": [model.base_logit_opacities], "lr": args.base_opacity_lr, "weight_decay": 0.0, "name": "base_logit_opacities"},
+                {"params": [model.base_log_scales], "lr": args.base_scaling_lr, "weight_decay": 0.0, "name": "base_log_scales"},
+                {"params": [model.base_quats], "lr": args.base_rotation_lr, "weight_decay": 0.0, "name": "base_quats"},
+            ]
+        )
     if conditioner is not None:
         param_groups.append(
             {"params": list(conditioner.fusion.parameters()), "lr": args.fusion_lr, "weight_decay": 0.0, "name": "image_fusion"}
@@ -391,23 +440,6 @@ def build_optimizer(model: MLPGaussianModel, args: argparse.Namespace, condition
         param_groups,
         eps=1.0e-15,
     )
-
-
-def sync_anchor_feature_optimizer(
-    optimizer: torch.optim.Optimizer,
-    previous_anchor_features: torch.nn.Parameter,
-    current_anchor_features: torch.nn.Parameter,
-) -> None:
-    """Point the optimizer at the resized anchor feature parameter after densification."""
-    if previous_anchor_features is current_anchor_features:
-        return
-    for group in optimizer.param_groups:
-        if group.get("name") == "anchor_features":
-            optimizer.state.pop(previous_anchor_features, None)
-            group["params"] = [current_anchor_features]
-            optimizer.state.setdefault(current_anchor_features, {})
-            return
-    raise RuntimeError("optimizer is missing the anchor_features parameter group")
 
 
 def count_trainable_parameters(module: torch.nn.Module) -> int:
@@ -447,7 +479,7 @@ def save_mlp_checkpoint(
     path.parent.mkdir(parents=True, exist_ok=True)
     payload_extra = {
         "args": vars(args),
-        "checkpoint_format": "mlpGs.vit_memory.v1" if conditioner is not None else "mlpGs.v1",
+        "checkpoint_format": "mlpGs.hybrid_base.v2" if conditioner is None else "mlpGs.hybrid_base.vit_memory.v2",
     }
     if conditioner is not None:
         payload_extra.update(
