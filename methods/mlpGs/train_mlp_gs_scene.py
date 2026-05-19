@@ -53,12 +53,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-densification", action="store_true", help="Turn off MLP-GS clone/split/prune.")
     parser.add_argument("--min-opacity", type=float, default=0.005, help="Prune Gaussians with opacity below this threshold.")
     parser.add_argument("--max-screen-radius", type=float, default=0.0, help="Prune Gaussians larger than this screen radius; 0 disables it.")
-    parser.add_argument(
-        "--opacity-reset-interval",
-        type=int,
-        default=0,
-        help="Reset predicted opacities every N steps; disabled by default for MLP-GS.",
-    )
     return parser.parse_args()
 
 
@@ -111,7 +105,7 @@ def main() -> None:
             percent_dense=0.01,
             min_opacity=args.min_opacity,
             max_screen_radius=args.max_screen_radius if args.max_screen_radius > 0 else None,
-            opacity_reset_interval=args.opacity_reset_interval,
+            opacity_reset_interval=0,
         )
     )
 
@@ -143,6 +137,8 @@ def main() -> None:
     print(f"输出目录：{out_dir}")
 
     started_at = time.perf_counter()
+    best_loss = float("inf")
+    best_loss_step = 0
     progress = tqdm(range(1, args.iterations + 1), desc="MLP-GS 训练进度", unit="步", dynamic_ncols=True)
     for step in progress:
         step_started_at = time.perf_counter()
@@ -165,6 +161,24 @@ def main() -> None:
             stats = densifier.update(model, render, step)
             sync_anchor_feature_optimizer(optimizer, previous_anchor_features, model.anchor_features)
 
+        current_loss = float(loss.detach())
+        if current_loss < best_loss:
+            best_loss = current_loss
+            best_loss_step = step
+            save_preview(out_dir / "best_loss.png", render.image)
+            save_ply_checkpoint(out_dir / "best_loss.ply", model)
+            save_mlp_checkpoint(
+                out_dir / "best_loss_mlp.pt",
+                model,
+                args,
+                extra={
+                    "best_loss": best_loss,
+                    "best_loss_step": best_loss_step,
+                    "best_loss_camera_index": camera_index,
+                    "best_loss_image_path": str(camera.image_path),
+                },
+            )
+
         if step == 1 or step % args.log_every == 0:
             with torch.no_grad():
                 psnr = compute_psnr(
@@ -177,11 +191,10 @@ def main() -> None:
                     f" clone={stats.cloned} split={stats.split} prune={stats.pruned} total={stats.total}"
                     f" high_grad={stats.high_grad} grad_max={stats.grad_max:.2e}"
                 )
-            if stats is not None and stats.opacity_reset:
-                densify_text += " opacity_reset=1"
             progress.set_postfix(
                 {
                     "loss": f"{float(loss.detach()):.4f}",
+                    "best": f"{best_loss:.4f}",
                     "训练PSNR": f"{psnr:.2f}",
                     "G": model.num_gaussians,
                     "单步": f"{time.perf_counter() - step_started_at:.2f}s",
@@ -205,6 +218,7 @@ def main() -> None:
     save_mlp_checkpoint(out_dir / "final_mlp.pt", model, args)
     print(
         f"训练完成：final.ply={out_dir / 'final.ply'}，final_mlp.pt={out_dir / 'final_mlp.pt'}，"
+        f"best_loss.ply={out_dir / 'best_loss.ply'}，best_loss={best_loss:.6f}@step={best_loss_step}，"
         f"总耗时 {format_duration(time.perf_counter() - started_at)}"
     )
 
@@ -270,16 +284,17 @@ def save_ply_checkpoint(path: Path, model: MLPGaussianModel) -> None:
     write_ply(str(path), data)
 
 
-def save_mlp_checkpoint(path: Path, model: MLPGaussianModel, args: argparse.Namespace) -> None:
+def save_mlp_checkpoint(path: Path, model: MLPGaussianModel, args: argparse.Namespace, extra: dict | None = None) -> None:
     """Save the MLP weights plus fixed anchors/base tensors for future reuse."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    payload_extra = {
+        "args": vars(args),
+        "checkpoint_format": "mlpGs.v1",
+    }
+    if extra:
+        payload_extra.update(extra)
     torch.save(
-        model.checkpoint_payload(
-            {
-                "args": vars(args),
-                "checkpoint_format": "mlpGs.v1",
-            }
-        ),
+        model.checkpoint_payload(payload_extra),
         path,
     )
 

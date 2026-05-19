@@ -36,11 +36,6 @@ class MLPDensificationController:
             with torch.no_grad():
                 stats = self._densify(model, render_output)
 
-        if self.config.opacity_reset_interval > 0 and step > 0 and step % self.config.opacity_reset_interval == 0:
-            with torch.no_grad():
-                model.reset_opacities(self.config.reset_opacity)
-            stats.opacity_reset = True
-            stats.total = model.num_gaussians
         return stats
 
     def _densify(self, model: MLPGaussianModel, render_output: RenderOutput) -> DensificationStats:
