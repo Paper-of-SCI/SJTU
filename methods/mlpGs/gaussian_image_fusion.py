@@ -59,6 +59,8 @@ class GaussianImageFusion(nn.Module):
         num_heads: int = 4,
         topk_views: int = 4,
         patch_window: int = 1,
+        residual_scale: float = 1.0,
+        output_init_std: float = 0.0,
     ) -> None:
         super().__init__()
         if anchor_feature_dim <= 0:
@@ -80,6 +82,8 @@ class GaussianImageFusion(nn.Module):
         self.num_heads = int(num_heads)
         self.topk_views = int(topk_views)
         self.patch_window = int(patch_window)
+        self.residual_scale = float(residual_scale)
+        self.output_init_std = float(output_init_std)
 
         self.query_proj = nn.Sequential(
             nn.Linear(3 + self.anchor_feature_dim, self.fusion_dim),
@@ -93,8 +97,12 @@ class GaussianImageFusion(nn.Module):
         )
         self.cross_attention = nn.MultiheadAttention(self.fusion_dim, self.num_heads, batch_first=True)
         self.output = nn.Linear(self.fusion_dim, self.anchor_feature_dim)
-        nn.init.zeros_(self.output.weight)
-        nn.init.zeros_(self.output.bias)
+        if self.output_init_std > 0.0:
+            nn.init.normal_(self.output.weight, mean=0.0, std=self.output_init_std)
+            nn.init.zeros_(self.output.bias)
+        else:
+            nn.init.zeros_(self.output.weight)
+            nn.init.zeros_(self.output.bias)
 
         offsets = [(dy, dx) for dy in range(-self.patch_window, self.patch_window + 1) for dx in range(-self.patch_window, self.patch_window + 1)]
         self.register_buffer("patch_offsets", torch.tensor(offsets, dtype=torch.long))
@@ -115,6 +123,7 @@ class GaussianImageFusion(nn.Module):
         if chunk_size <= 0:
             raise ValueError("fusion_chunk_size must be positive")
 
+        adapted_tokens = self.adapt_memory(memory.tokens.to(device=anchor_xyz.device, dtype=anchor_features.dtype))
         fused_chunks = []
         for start in range(0, anchor_xyz.shape[0], chunk_size):
             end = min(start + chunk_size, anchor_xyz.shape[0])
@@ -125,9 +134,14 @@ class GaussianImageFusion(nn.Module):
                     anchor_features[start:end],
                     cameras,
                     memory,
+                    adapted_tokens,
                 )
             )
         return torch.cat(fused_chunks, dim=0)
+
+    def adapt_memory(self, tokens: Tensor) -> Tensor:
+        views, patches, token_dim = tokens.shape
+        return self.token_adapter(tokens.reshape(views * patches, token_dim)).reshape(views, patches, self.fusion_dim)
 
     def _forward_chunk(
         self,
@@ -136,9 +150,19 @@ class GaussianImageFusion(nn.Module):
         anchor_features: Tensor,
         cameras: FusionCameraBatch,
         memory: ViTPatchMemory,
+        adapted_tokens: Tensor,
     ) -> Tensor:
         topk_indices, patch_x, patch_y, visible = project_gaussians_to_patch_grid(anchor_xyz.detach(), cameras, memory, self.topk_views)
-        token_context, token_valid = gather_local_patch_tokens(memory, topk_indices, patch_x, patch_y, visible, self.patch_offsets)
+        token_context, token_valid = gather_local_patch_tokens(
+            adapted_tokens,
+            memory.grid_height,
+            memory.grid_width,
+            topk_indices,
+            patch_x,
+            patch_y,
+            visible,
+            self.patch_offsets,
+        )
 
         batch, token_count, token_dim = token_context.shape
         has_context = token_valid.any(dim=1)
@@ -150,10 +174,9 @@ class GaussianImageFusion(nn.Module):
 
         query_input = torch.cat([normalized_anchor_xyz, anchor_features], dim=-1)
         query = self.query_proj(query_input).unsqueeze(1)
-        key_value = self.token_adapter(token_context.reshape(batch * token_count, token_dim)).reshape(batch, token_count, self.fusion_dim)
-        attended, _ = self.cross_attention(query, key_value, key_value, key_padding_mask=~safe_valid, need_weights=False)
+        attended, _ = self.cross_attention(query, token_context, token_context, key_padding_mask=~safe_valid, need_weights=False)
         delta = self.output(attended.squeeze(1)) * has_context.to(dtype=anchor_features.dtype).unsqueeze(-1)
-        return anchor_features + delta
+        return anchor_features + self.residual_scale * delta
 
 
 def project_gaussians_to_patch_grid(
@@ -202,7 +225,9 @@ def project_gaussians_to_patch_grid(
 
 
 def gather_local_patch_tokens(
-    memory: ViTPatchMemory,
+    tokens: Tensor,
+    grid_height: int,
+    grid_width: int,
     view_indices: Tensor,
     patch_x: Tensor,
     patch_y: Tensor,
@@ -210,17 +235,16 @@ def gather_local_patch_tokens(
     offsets: Tensor,
 ) -> tuple[Tensor, Tensor]:
     """Gather local patch windows for each Gaussian/top-k view pair."""
-    tokens = memory.tokens.to(device=view_indices.device)
     offsets = offsets.to(device=view_indices.device)
     offset_y = offsets[:, 0]
     offset_x = offsets[:, 1]
 
     x = patch_x[..., None] + offset_x
     y = patch_y[..., None] + offset_y
-    patch_valid = view_visible[..., None] & (x >= 0) & (x < memory.grid_width) & (y >= 0) & (y < memory.grid_height)
-    x_safe = x.clamp(0, memory.grid_width - 1)
-    y_safe = y.clamp(0, memory.grid_height - 1)
-    patch_indices = y_safe * memory.grid_width + x_safe
+    patch_valid = view_visible[..., None] & (x >= 0) & (x < grid_width) & (y >= 0) & (y < grid_height)
+    x_safe = x.clamp(0, grid_width - 1)
+    y_safe = y.clamp(0, grid_height - 1)
+    patch_indices = y_safe * grid_width + x_safe
 
     gathered = tokens[view_indices[..., None].expand_as(patch_indices), patch_indices]
     batch = view_indices.shape[0]

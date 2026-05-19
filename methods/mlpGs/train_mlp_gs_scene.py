@@ -71,6 +71,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-rotation-lr", type=float, default=1.0e-3, help="LR for trainable Gaussian base rotations.")
     parser.add_argument("--use-vit-memory", action="store_true", help="Condition anchors on frozen ViT patch memory from training views.")
     parser.add_argument("--vit-weights", default="DEFAULT", help="torchvision ViT_B_16 weights name; use 'none' for random weights.")
+    parser.add_argument("--vit-image-size", type=int, default=224, help="Square ViT input size; larger values create denser patch memory.")
     parser.add_argument("--vit-batch-size", type=int, default=4, help="Batch size for precomputing frozen ViT patch tokens.")
     parser.add_argument("--vit-topk-views", type=int, default=4, help="Top-K visible source views used by each Gaussian.")
     parser.add_argument("--vit-patch-window", type=int, default=1, help="Patch window radius around each projected Gaussian.")
@@ -78,6 +79,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fusion-heads", type=int, default=4, help="Attention heads for Gaussian-image fusion.")
     parser.add_argument("--fusion-lr", type=float, default=1.0e-3, help="Adam learning rate for ViT-memory fusion parameters.")
     parser.add_argument("--fusion-chunk-size", type=int, default=4096, help="Number of Gaussians fused per chunk.")
+    parser.add_argument("--fusion-residual-scale", type=float, default=1.0, help="Multiplier for the ViT fusion residual added to anchor features.")
+    parser.add_argument("--fusion-output-init-std", type=float, default=0.0, help="Stddev for nonzero fusion output init; 0 keeps the old zero-init behavior.")
     parser.add_argument("--densify-grad-threshold", type=float, default=2.0e-5, help="Screen-space gradient threshold for clone/split.")
     parser.add_argument("--densify-from", type=int, default=500, help="Start MLP-GS densification at this step.")
     parser.add_argument("--densify-until", type=int, default=0, help="Stop densification at this step; 0 means iterations - 500.")
@@ -198,10 +201,12 @@ def main() -> None:
     if conditioner is not None:
         print(
             f"ViT-memory：启用，source_views={conditioner.patch_memory.num_views}，"
+            f"vit_image_size={conditioner.patch_memory.image_size}，"
             f"patch={conditioner.patch_memory.grid_width}x{conditioner.patch_memory.grid_height}，"
             f"token_dim={conditioner.patch_memory.token_dim}，topk={args.vit_topk_views}，"
             f"window={(2 * args.vit_patch_window + 1)}x{(2 * args.vit_patch_window + 1)}，"
-            f"fusion_params={fusion_params:,}，fusion_lr={args.fusion_lr:g}"
+            f"fusion_params={fusion_params:,}，fusion_lr={args.fusion_lr:g}，"
+            f"fusion_residual_scale={args.fusion_residual_scale:g}，fusion_output_init_std={args.fusion_output_init_std:g}"
         )
     else:
         print("ViT-memory：未启用")
@@ -371,7 +376,7 @@ def build_vit_conditioner(
         raise ValueError("--use-vit-memory 需要 --feature-dim > 0")
 
     print("ViT-memory：开始提取训练图 patch tokens（ViT 主干冻结）...")
-    extractor = FrozenViTPatchExtractor(weights=args.vit_weights, device=device)
+    extractor = FrozenViTPatchExtractor(weights=args.vit_weights, image_size=args.vit_image_size, device=device)
     patch_memory = extractor.build_memory(train_cameras, batch_size=args.vit_batch_size)
     del extractor
     torch.cuda.empty_cache()
@@ -384,6 +389,8 @@ def build_vit_conditioner(
         num_heads=args.fusion_heads,
         topk_views=args.vit_topk_views,
         patch_window=args.vit_patch_window,
+        residual_scale=args.fusion_residual_scale,
+        output_init_std=args.fusion_output_init_std,
     ).to(device)
     return ViTConditioner(
         fusion=fusion,
@@ -441,7 +448,6 @@ def build_optimizer(model: MLPGaussianModel, args: argparse.Namespace, condition
         eps=1.0e-15,
     )
 
-
 def count_trainable_parameters(module: torch.nn.Module) -> int:
     return sum(param.numel() for param in module.parameters() if param.requires_grad)
 
@@ -491,6 +497,8 @@ def save_mlp_checkpoint(
                     "vit_topk_views": conditioner.fusion.topk_views,
                     "vit_patch_window": conditioner.fusion.patch_window,
                     "fusion_chunk_size": conditioner.chunk_size,
+                    "fusion_residual_scale": conditioner.fusion.residual_scale,
+                    "fusion_output_init_std": conditioner.fusion.output_init_std,
                 },
                 "vit_memory": conditioner.patch_memory.metadata(),
             }
