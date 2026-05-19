@@ -17,8 +17,9 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from mlp_densification import MLPDensificationController
 from mlp_gaussian_model import MLPGaussianModel
-from modules import Camera, GaussianModel, GaussianRenderer, photometric_loss
+from modules import Camera, DensificationConfig, GaussianModel, GaussianRenderer, photometric_loss
 from utils.dataset_loaders import load_colmap_dataset
 from utils.image_utils import compute_psnr, save_image
 from utils.ply_io import gaussians_to_ply_dict, write_ply
@@ -41,6 +42,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mlp-hidden-layers", type=int, default=3, help="Number of hidden layers in the MLP.")
     parser.add_argument("--mlp-lr", type=float, default=1.0e-3, help="Adam learning rate for MLP parameters.")
     parser.add_argument("--mlp-weight-decay", type=float, default=0.0, help="Adam weight decay for MLP parameters.")
+    parser.add_argument("--densify-grad-threshold", type=float, default=2.0e-5, help="Screen-space gradient threshold for clone/split.")
+    parser.add_argument("--densify-from", type=int, default=500, help="Start MLP-GS densification at this step.")
+    parser.add_argument("--densify-until", type=int, default=0, help="Stop densification at this step; 0 means iterations - 500.")
+    parser.add_argument("--densification-interval", type=int, default=100, help="Run densification every N steps.")
+    parser.add_argument("--disable-densification", action="store_true", help="Turn off MLP-GS clone/split/prune.")
+    parser.add_argument("--opacity-reset-interval", type=int, default=3000, help="Reset predicted opacities every N steps; set 0 to disable.")
     return parser.parse_args()
 
 
@@ -79,6 +86,19 @@ def main() -> None:
     ).to(device)
     renderer = GaussianRenderer(background=(1.0, 1.0, 1.0))
     optimizer = torch.optim.Adam(model.parameters(), lr=args.mlp_lr, weight_decay=args.mlp_weight_decay, eps=1.0e-15)
+    densify_until = args.densify_until if args.densify_until > 0 else max(args.iterations - 500, args.densify_from + 1)
+    densifier = MLPDensificationController(
+        DensificationConfig(
+            start_step=args.densify_from,
+            stop_step=densify_until,
+            interval=args.densification_interval,
+            grad_threshold=args.densify_grad_threshold,
+            scene_extent=float(scene.scene_extent),
+            percent_dense=0.01,
+            min_opacity=0.005,
+            opacity_reset_interval=args.opacity_reset_interval,
+        )
+    )
 
     train_cameras = build_cameras(scene, device)
     test_cameras = build_cameras(test_scene, device)
@@ -95,10 +115,14 @@ def main() -> None:
         f"holdout={args.holdout}，分辨率={scene.width}x{scene.height}，降采样 factor={args.factor}"
     )
     print(
-        f"MLP-GS：Gaussian 数量固定为 {model.num_gaussians}，MLP 参数量={trainable_params:,}，"
+        f"MLP-GS：初始 Gaussian 数量={model.num_gaussians}，MLP 参数量={trainable_params:,}，"
         f"hidden_dim={args.mlp_hidden_dim}，hidden_layers={args.mlp_hidden_layers}，lr={args.mlp_lr:g}"
     )
-    print("致密化：关闭；第一版只验证 MLP -> Gaussian -> render -> loss -> backward 链路。")
+    print(
+        f"致密化：{not args.disable_densification}，start={args.densify_from}，stop={densify_until}，"
+        f"interval={args.densification_interval}，grad_threshold={args.densify_grad_threshold:g}"
+    )
+    print("注意：这里一个 anchor 就是一个 Gaussian；clone/split 新增的是下一轮会输入 MLP 的高斯位置。")
     print(f"输出目录：{out_dir}")
 
     started_at = time.perf_counter()
@@ -118,12 +142,24 @@ def main() -> None:
         loss.backward()
         optimizer.step()
 
+        stats = None
+        if not args.disable_densification:
+            stats = densifier.update(model, render, step)
+
         if step == 1 or step % args.log_every == 0:
             with torch.no_grad():
                 psnr = compute_psnr(
                     render.image.detach().clamp(0.0, 1.0).permute(1, 2, 0).cpu().numpy(),
                     gt_image.detach().permute(1, 2, 0).cpu().numpy(),
                 )
+            densify_text = ""
+            if stats is not None and stats.densified:
+                densify_text = (
+                    f" clone={stats.cloned} split={stats.split} prune={stats.pruned} total={stats.total}"
+                    f" high_grad={stats.high_grad} grad_max={stats.grad_max:.2e}"
+                )
+            if stats is not None and stats.opacity_reset:
+                densify_text += " opacity_reset=1"
             progress.set_postfix(
                 {
                     "loss": f"{float(loss.detach()):.4f}",
@@ -135,7 +171,7 @@ def main() -> None:
             tqdm.write(
                 f"第 {step:06d} 步 | loss={float(loss.detach()):.6f} | "
                 f"L1={float(parts['l1'].detach()):.6f} | SSIM={float(parts['ssim'].detach()):.4f} | "
-                f"训练PSNR={psnr:.2f} | Gaussian={model.num_gaussians}"
+                f"训练PSNR={psnr:.2f} | Gaussian={model.num_gaussians}{densify_text}"
             )
 
         if args.eval_every > 0 and (step == 1 or step % args.eval_every == 0 or step == args.iterations):
