@@ -51,7 +51,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--densify-until", type=int, default=0, help="Stop densification at this step; 0 means iterations - 500.")
     parser.add_argument("--densification-interval", type=int, default=100, help="Run densification every N steps.")
     parser.add_argument("--disable-densification", action="store_true", help="Turn off MLP-GS clone/split/prune.")
-    parser.add_argument("--opacity-reset-interval", type=int, default=3000, help="Reset predicted opacities every N steps; set 0 to disable.")
+    parser.add_argument("--min-opacity", type=float, default=0.005, help="Prune Gaussians with opacity below this threshold.")
+    parser.add_argument("--max-screen-radius", type=float, default=0.0, help="Prune Gaussians larger than this screen radius; 0 disables it.")
+    parser.add_argument(
+        "--opacity-reset-interval",
+        type=int,
+        default=0,
+        help="Reset predicted opacities every N steps; disabled by default for MLP-GS.",
+    )
     return parser.parse_args()
 
 
@@ -102,7 +109,8 @@ def main() -> None:
             grad_threshold=args.densify_grad_threshold,
             scene_extent=float(scene.scene_extent),
             percent_dense=0.01,
-            min_opacity=0.005,
+            min_opacity=args.min_opacity,
+            max_screen_radius=args.max_screen_radius if args.max_screen_radius > 0 else None,
             opacity_reset_interval=args.opacity_reset_interval,
         )
     )
@@ -128,7 +136,8 @@ def main() -> None:
     )
     print(
         f"致密化：{not args.disable_densification}，start={args.densify_from}，stop={densify_until}，"
-        f"interval={args.densification_interval}，grad_threshold={args.densify_grad_threshold:g}"
+        f"interval={args.densification_interval}，grad_threshold={args.densify_grad_threshold:g}，"
+        f"min_opacity={args.min_opacity:g}"
     )
     print("注意：这里一个 anchor 就是一个 Gaussian；clone/split 新增的是下一轮会输入 MLP 的高斯位置。")
     print(f"输出目录：{out_dir}")
