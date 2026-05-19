@@ -41,6 +41,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mlp-hidden-dim", type=int, default=128, help="Hidden width of the Gaussian-parameter MLP.")
     parser.add_argument("--mlp-hidden-layers", type=int, default=3, help="Number of hidden layers in the MLP.")
     parser.add_argument("--mlp-lr", type=float, default=1.0e-3, help="Adam learning rate for MLP parameters.")
+    parser.add_argument("--feature-dim", type=int, default=32, help="Per-Gaussian learnable feature dimension.")
+    parser.add_argument("--feature-lr", type=float, default=1.0e-2, help="Adam learning rate for per-Gaussian features.")
+    parser.add_argument("--feature-init-std", type=float, default=0.01, help="Initial stddev for per-Gaussian features.")
+    parser.add_argument("--feature-split-noise-std", type=float, default=0.01, help="Noise stddev added to split-child features.")
     parser.add_argument("--mlp-weight-decay", type=float, default=0.0, help="Adam weight decay for MLP parameters.")
     parser.add_argument("--densify-grad-threshold", type=float, default=2.0e-5, help="Screen-space gradient threshold for clone/split.")
     parser.add_argument("--densify-from", type=int, default=500, help="Start MLP-GS densification at this step.")
@@ -83,9 +87,12 @@ def main() -> None:
         base_model,
         hidden_dim=args.mlp_hidden_dim,
         hidden_layers=args.mlp_hidden_layers,
+        feature_dim=args.feature_dim,
+        feature_init_std=args.feature_init_std,
+        feature_split_noise_std=args.feature_split_noise_std,
     ).to(device)
     renderer = GaussianRenderer(background=(1.0, 1.0, 1.0))
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.mlp_lr, weight_decay=args.mlp_weight_decay, eps=1.0e-15)
+    optimizer = build_optimizer(model, args)
     densify_until = args.densify_until if args.densify_until > 0 else max(args.iterations - 500, args.densify_from + 1)
     densifier = MLPDensificationController(
         DensificationConfig(
@@ -116,7 +123,8 @@ def main() -> None:
     )
     print(
         f"MLP-GS：初始 Gaussian 数量={model.num_gaussians}，MLP 参数量={trainable_params:,}，"
-        f"hidden_dim={args.mlp_hidden_dim}，hidden_layers={args.mlp_hidden_layers}，lr={args.mlp_lr:g}"
+        f"hidden_dim={args.mlp_hidden_dim}，hidden_layers={args.mlp_hidden_layers}，"
+        f"feature_dim={args.feature_dim}，mlp_lr={args.mlp_lr:g}，feature_lr={args.feature_lr:g}"
     )
     print(
         f"致密化：{not args.disable_densification}，start={args.densify_from}，stop={densify_until}，"
@@ -144,7 +152,9 @@ def main() -> None:
 
         stats = None
         if not args.disable_densification:
+            previous_anchor_features = model.anchor_features
             stats = densifier.update(model, render, step)
+            sync_anchor_feature_optimizer(optimizer, previous_anchor_features, model.anchor_features)
 
         if step == 1 or step % args.log_every == 0:
             with torch.no_grad():
@@ -200,6 +210,34 @@ def require_camera_image(camera: Camera) -> Tensor:
     if camera.image is None:
         raise RuntimeError(f"相机缺少 GT 图像，无法计算图像损失: {camera.image_path}")
     return camera.image
+
+
+def build_optimizer(model: MLPGaussianModel, args: argparse.Namespace) -> torch.optim.Adam:
+    """Build Adam for shared MLP weights plus per-Gaussian learnable features."""
+    return torch.optim.Adam(
+        [
+            {"params": list(model.mlp.parameters()), "lr": args.mlp_lr, "weight_decay": args.mlp_weight_decay, "name": "mlp"},
+            {"params": [model.anchor_features], "lr": args.feature_lr, "weight_decay": 0.0, "name": "anchor_features"},
+        ],
+        eps=1.0e-15,
+    )
+
+
+def sync_anchor_feature_optimizer(
+    optimizer: torch.optim.Optimizer,
+    previous_anchor_features: torch.nn.Parameter,
+    current_anchor_features: torch.nn.Parameter,
+) -> None:
+    """Point the optimizer at the resized anchor feature parameter after densification."""
+    if previous_anchor_features is current_anchor_features:
+        return
+    for group in optimizer.param_groups:
+        if group.get("name") == "anchor_features":
+            optimizer.state.pop(previous_anchor_features, None)
+            group["params"] = [current_anchor_features]
+            optimizer.state.setdefault(current_anchor_features, {})
+            return
+    raise RuntimeError("optimizer is missing the anchor_features parameter group")
 
 
 def save_preview(path: Path, image: Tensor) -> None:

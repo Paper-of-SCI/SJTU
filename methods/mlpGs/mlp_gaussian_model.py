@@ -45,6 +45,9 @@ class MLPGaussianModel(nn.Module):
         sh_degree: int = 3,
         hidden_dim: int = 128,
         hidden_layers: int = 3,
+        feature_dim: int = 32,
+        feature_init_std: float = 0.01,
+        feature_split_noise_std: float = 0.01,
     ) -> None:
         super().__init__()
         if anchor_xyz.ndim != 2 or anchor_xyz.shape[-1] != 3:
@@ -53,16 +56,22 @@ class MLPGaussianModel(nn.Module):
             raise ValueError("hidden_dim must be positive")
         if hidden_layers < 1:
             raise ValueError("hidden_layers must be >= 1")
+        if feature_dim < 0:
+            raise ValueError("feature_dim must be >= 0")
 
         self.sh_degree = int(sh_degree)
         self.hidden_dim = int(hidden_dim)
         self.hidden_layers = int(hidden_layers)
+        self.feature_dim = int(feature_dim)
+        self.feature_init_std = float(feature_init_std)
+        self.feature_split_noise_std = float(feature_split_noise_std)
         self.rest_bases = max(num_sh_bases(self.sh_degree) - 1, 0)
 
         self.register_buffer("anchor_xyz", anchor_xyz.detach().clone())
         self.register_buffer("input_center", anchor_xyz.detach().mean(dim=0, keepdim=True))
         input_scale = (anchor_xyz.detach() - self.input_center).norm(dim=-1).max().clamp_min(1.0e-6)
         self.register_buffer("input_scale", input_scale)
+        self.anchor_features = nn.Parameter(self._initial_anchor_features(anchor_xyz.shape[0], anchor_xyz.device, anchor_xyz.dtype))
 
         self.register_buffer("base_means", base_tensors.means.detach().clone())
         self.register_buffer("base_log_scales", base_tensors.log_scales.detach().clone())
@@ -74,7 +83,7 @@ class MLPGaussianModel(nn.Module):
         self.register_buffer("gradient_count", torch.zeros(anchor_xyz.shape[0], device=anchor_xyz.device))
 
         self.mlp = self._build_mlp(
-            input_dim=3,
+            input_dim=3 + self.feature_dim,
             hidden_dim=self.hidden_dim,
             hidden_layers=self.hidden_layers,
             output_dim=self.raw_output_dim,
@@ -86,6 +95,9 @@ class MLPGaussianModel(nn.Module):
         base_model: GaussianModel,
         hidden_dim: int = 128,
         hidden_layers: int = 3,
+        feature_dim: int = 32,
+        feature_init_std: float = 0.01,
+        feature_split_noise_std: float = 0.01,
     ) -> "MLPGaussianModel":
         """Create an MLP-GS model from the standard point-cloud initialization."""
         base_tensors = RawGaussianTensors(
@@ -102,6 +114,9 @@ class MLPGaussianModel(nn.Module):
             sh_degree=base_model.sh_degree,
             hidden_dim=hidden_dim,
             hidden_layers=hidden_layers,
+            feature_dim=feature_dim,
+            feature_init_std=feature_init_std,
+            feature_split_noise_std=feature_split_noise_std,
         )
 
     @property
@@ -195,6 +210,9 @@ class MLPGaussianModel(nn.Module):
             "sh_degree": self.sh_degree,
             "hidden_dim": self.hidden_dim,
             "hidden_layers": self.hidden_layers,
+            "feature_dim": self.feature_dim,
+            "feature_init_std": self.feature_init_std,
+            "feature_split_noise_std": self.feature_split_noise_std,
             "num_gaussians": self.num_gaussians,
             "raw_output_dim": self.raw_output_dim,
         }
@@ -255,7 +273,8 @@ class MLPGaussianModel(nn.Module):
             return 0
         raw = self.export_tensors()
         target = _index_raw_tensors(raw, mask)
-        return self.append_gaussians(target.means, target)
+        new_features = self.anchor_features.detach()[mask]
+        return self.append_gaussians(target.means, target, new_features)
 
     def split(self, mask: Tensor, num_splits: int = 2, scale_shrink: float = 1.6) -> int:
         """Split selected Gaussians and remove their parents."""
@@ -288,7 +307,10 @@ class MLPGaussianModel(nn.Module):
                 -1, self.rest_bases, 3
             ),
         )
-        added = self.append_gaussians(new_means, target)
+        new_features = self.anchor_features.detach()[selected][:, None, :].expand(-1, num_splits, -1).reshape(-1, self.feature_dim)
+        if self.feature_split_noise_std > 0 and self.feature_dim > 0:
+            new_features = new_features + torch.randn_like(new_features) * self.feature_split_noise_std
+        added = self.append_gaussians(new_means, target, new_features)
 
         remove_mask = torch.zeros(self.num_gaussians, dtype=torch.bool, device=self.anchor_xyz.device)
         remove_mask[selected] = True
@@ -303,6 +325,7 @@ class MLPGaussianModel(nn.Module):
             return keep
         self._replace_gaussian_buffers(
             anchor_xyz=self.anchor_xyz.detach()[keep],
+            anchor_features=self.anchor_features.detach()[keep],
             base_tensors=RawGaussianTensors(
                 means=self.base_means.detach()[keep],
                 log_scales=self.base_log_scales.detach()[keep],
@@ -321,11 +344,14 @@ class MLPGaussianModel(nn.Module):
         deltas = self._predict_deltas(self.anchor_xyz)
         self.base_logit_opacities = self.base_logit_opacities.new_full((self.num_gaussians, 1), logit) - deltas.logit_opacities.detach()
 
-    def append_gaussians(self, anchor_xyz: Tensor, target_tensors: RawGaussianTensors) -> int:
+    def append_gaussians(self, anchor_xyz: Tensor, target_tensors: RawGaussianTensors, anchor_features: Tensor | None = None) -> int:
         """Append new anchors whose first forward pass equals ``target_tensors``."""
+        if anchor_features is None:
+            anchor_features = self._initial_anchor_features(anchor_xyz.shape[0], anchor_xyz.device, anchor_xyz.dtype)
         n_new = _infer_count(
             [
                 anchor_xyz,
+                anchor_features,
                 target_tensors.means,
                 target_tensors.log_scales,
                 target_tensors.quats,
@@ -337,10 +363,12 @@ class MLPGaussianModel(nn.Module):
         if n_new == 0:
             return 0
         anchor_xyz = anchor_xyz.to(device=self.anchor_xyz.device, dtype=self.anchor_xyz.dtype).detach()
+        anchor_features = anchor_features.to(device=self.anchor_xyz.device, dtype=self.anchor_xyz.dtype).detach()
         target_tensors = _raw_to(target_tensors, device=self.anchor_xyz.device, dtype=self.anchor_xyz.dtype)
-        base_new = self._base_tensors_for_targets(anchor_xyz, target_tensors)
+        base_new = self._base_tensors_for_targets(anchor_xyz, anchor_features, target_tensors)
         self._replace_gaussian_buffers(
             anchor_xyz=torch.cat([self.anchor_xyz.detach(), anchor_xyz], dim=0),
+            anchor_features=torch.cat([self.anchor_features.detach(), anchor_features], dim=0),
             base_tensors=RawGaussianTensors(
                 means=torch.cat([self.base_means.detach(), base_new.means], dim=0),
                 log_scales=torch.cat([self.base_log_scales.detach(), base_new.log_scales], dim=0),
@@ -353,13 +381,21 @@ class MLPGaussianModel(nn.Module):
         return n_new
 
     def normalized_inputs(self) -> Tensor:
-        return self.normalized_inputs_for(self.anchor_xyz)
+        return self.mlp_inputs_for(self.anchor_xyz, self.anchor_features)
 
     def normalized_inputs_for(self, anchor_xyz: Tensor) -> Tensor:
         return (anchor_xyz - self.input_center) / self.input_scale
 
-    def _predict_deltas(self, anchor_xyz: Tensor) -> RawGaussianTensors:
-        deltas = self.mlp(self.normalized_inputs_for(anchor_xyz))
+    def mlp_inputs_for(self, anchor_xyz: Tensor, anchor_features: Tensor) -> Tensor:
+        xyz_inputs = self.normalized_inputs_for(anchor_xyz)
+        if self.feature_dim == 0:
+            return xyz_inputs
+        return torch.cat([xyz_inputs, anchor_features], dim=-1)
+
+    def _predict_deltas(self, anchor_xyz: Tensor, anchor_features: Tensor | None = None) -> RawGaussianTensors:
+        if anchor_features is None:
+            anchor_features = self.anchor_features
+        deltas = self.mlp(self.mlp_inputs_for(anchor_xyz, anchor_features))
         return self._unpack_deltas(deltas)
 
     def _unpack_deltas(self, deltas: Tensor) -> RawGaussianTensors:
@@ -390,8 +426,13 @@ class MLPGaussianModel(nn.Module):
             features_rest=delta_features_rest,
         )
 
-    def _base_tensors_for_targets(self, anchor_xyz: Tensor, target_tensors: RawGaussianTensors) -> RawGaussianTensors:
-        deltas = self._predict_deltas(anchor_xyz)
+    def _base_tensors_for_targets(
+        self,
+        anchor_xyz: Tensor,
+        anchor_features: Tensor,
+        target_tensors: RawGaussianTensors,
+    ) -> RawGaussianTensors:
+        deltas = self._predict_deltas(anchor_xyz, anchor_features)
         return RawGaussianTensors(
             means=target_tensors.means.detach() - deltas.means.detach(),
             log_scales=target_tensors.log_scales.detach() - deltas.log_scales.detach(),
@@ -401,8 +442,9 @@ class MLPGaussianModel(nn.Module):
             features_rest=target_tensors.features_rest.detach() - deltas.features_rest.detach(),
         )
 
-    def _replace_gaussian_buffers(self, anchor_xyz: Tensor, base_tensors: RawGaussianTensors) -> None:
+    def _replace_gaussian_buffers(self, anchor_xyz: Tensor, anchor_features: Tensor, base_tensors: RawGaussianTensors) -> None:
         self.anchor_xyz = anchor_xyz.detach().clone()
+        self.anchor_features = nn.Parameter(anchor_features.detach().clone())
         self.base_means = base_tensors.means.detach().clone()
         self.base_log_scales = base_tensors.log_scales.detach().clone()
         self.base_quats = base_tensors.quats.detach().clone()
@@ -414,6 +456,13 @@ class MLPGaussianModel(nn.Module):
     def _reset_gradient_buffers(self, count: int, device: torch.device) -> None:
         self.gradient_accum = torch.zeros(count, device=device)
         self.gradient_count = torch.zeros(count, device=device)
+
+    def _initial_anchor_features(self, count: int, device: torch.device, dtype: torch.dtype) -> Tensor:
+        if self.feature_dim == 0:
+            return torch.empty(count, 0, device=device, dtype=dtype)
+        features = torch.empty(count, self.feature_dim, device=device, dtype=dtype)
+        nn.init.normal_(features, mean=0.0, std=self.feature_init_std)
+        return features
 
     @staticmethod
     def _build_mlp(input_dim: int, hidden_dim: int, hidden_layers: int, output_dim: int) -> nn.Sequential:
