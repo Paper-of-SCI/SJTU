@@ -11,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 from tqdm import tqdm
 
@@ -50,6 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-every", type=int, default=50, help="Console log interval.")
     parser.add_argument("--eval-every", type=int, default=500, help="Evaluate held-out test views every N iterations; set 0 to disable.")
     parser.add_argument("--eval-lpips", action="store_true", help="Also compute LPIPS during eval and save best_test_lpips checkpoints.")
+    parser.add_argument("--eval-lpips-size", type=int, default=512, help="Resize long side before training-time LPIPS; 0 keeps full resolution.")
     parser.add_argument("--seed", type=int, default=0, help="Random seed.")
     parser.add_argument("--mlp-hidden-dim", type=int, default=128, help="Hidden width of the Gaussian-parameter MLP.")
     parser.add_argument("--mlp-hidden-layers", type=int, default=3, help="Number of hidden layers in the MLP.")
@@ -145,7 +147,7 @@ def main() -> None:
         train_base=not args.freeze_gaussian_base,
     ).to(device)
     renderer = GaussianRenderer(background=(1.0, 1.0, 1.0))
-    lpips_evaluator = LPIPSEvaluator(device) if args.eval_lpips else None
+    lpips_evaluator = LPIPSEvaluator(device, max_size=args.eval_lpips_size) if args.eval_lpips else None
 
     train_cameras = build_cameras(scene, device)
     test_cameras = build_cameras(test_scene, device)
@@ -577,18 +579,35 @@ def evaluate_metrics(
 class LPIPSEvaluator:
     """Optional LPIPS wrapper used only when --eval-lpips is enabled."""
 
-    def __init__(self, device: torch.device) -> None:
+    def __init__(self, device: torch.device, max_size: int = 512) -> None:
         try:
             import lpips
         except ImportError as exc:
             raise ImportError("计算 eval LPIPS 需要安装 lpips：pip install lpips") from exc
         self.model = lpips.LPIPS(net="vgg").to(device).eval()
+        self.max_size = int(max_size)
 
     @torch.no_grad()
     def __call__(self, image: Tensor, gt: Tensor) -> float:
         image_bchw = image.unsqueeze(0) * 2.0 - 1.0
         gt_bchw = gt.unsqueeze(0) * 2.0 - 1.0
+        image_bchw, gt_bchw = self._resize_for_eval(image_bchw, gt_bchw)
         return float(self.model(image_bchw, gt_bchw).detach().reshape(-1)[0])
+
+    def _resize_for_eval(self, image: Tensor, gt: Tensor) -> tuple[Tensor, Tensor]:
+        if self.max_size <= 0:
+            return image, gt
+        _, _, height, width = image.shape
+        long_side = max(height, width)
+        if long_side <= self.max_size:
+            return image, gt
+        scale = self.max_size / float(long_side)
+        new_height = max(1, int(round(height * scale)))
+        new_width = max(1, int(round(width * scale)))
+        size = (new_height, new_width)
+        image = F.interpolate(image, size=size, mode="bilinear", align_corners=False)
+        gt = F.interpolate(gt, size=size, mode="bilinear", align_corners=False)
+        return image, gt
 
 
 def is_finite(value: float) -> bool:
