@@ -46,21 +46,18 @@ def gaussians_to_ply_dict(
         "x": means[:, 0].astype(np.float32),
         "y": means[:, 1].astype(np.float32),
         "z": means[:, 2].astype(np.float32),
-        "nx": np.zeros(n, dtype=np.float32),
-        "ny": np.zeros(n, dtype=np.float32),
-        "nz": np.zeros(n, dtype=np.float32),
     }
+    for i in range(3):
+        data[f"scale_{i}"] = log_scales[:, i].astype(np.float32)
+    for i in range(4):
+        data[f"rot_{i}"] = quats[:, i].astype(np.float32)
+    data["opacity"] = logit_opacities.reshape(n).astype(np.float32)
     dc = features_dc.reshape(n, -1)
     for i in range(dc.shape[1]):
         data[f"f_dc_{i}"] = dc[:, i].astype(np.float32)
     rest = features_rest.transpose(0, 2, 1).reshape(n, -1)
     for i in range(rest.shape[1]):
         data[f"f_rest_{i}"] = rest[:, i].astype(np.float32)
-    data["opacity"] = logit_opacities.reshape(n).astype(np.float32)
-    for i in range(3):
-        data[f"scale_{i}"] = log_scales[:, i].astype(np.float32)
-    for i in range(4):
-        data[f"rot_{i}"] = quats[:, i].astype(np.float32)
     return data
 
 
