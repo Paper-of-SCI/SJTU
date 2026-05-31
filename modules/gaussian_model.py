@@ -176,10 +176,15 @@ class GaussianModel(nn.Module):
         self.replace_tensors(updated)
         return n_new
 
-    def clone(self, mask: Tensor) -> int:
-        """Append exact copies of selected Gaussians."""
+    def clone(self, mask: Tensor, position_jitter_scale: float = 0.0) -> int:
+        """Append copies of selected Gaussians, optionally jittering child positions."""
         mask = _as_bool_mask(mask, self.num_gaussians, self.means.device)
         tensors = {name: getattr(self, name).detach()[mask] for name in PARAMETER_NAMES}
+        if position_jitter_scale > 0.0 and tensors["means"].numel() > 0:
+            selected = mask.nonzero(as_tuple=True)[0]
+            rotations = quats_to_rotmats(self.normalized_quats.detach()[selected])
+            local_offsets = torch.randn_like(tensors["means"]) * self.scales.detach()[selected] * float(position_jitter_scale)
+            tensors["means"] = tensors["means"] + torch.matmul(rotations, local_offsets[..., None]).squeeze(-1)
         return self.append_tensors(tensors)
 
     def split(self, mask: Tensor, num_splits: int = 2, scale_shrink: float = 1.6) -> tuple[int, Tensor]:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import random
 import sys
 import time
@@ -24,6 +25,8 @@ from modules import (
     GaussianModel,
     GaussianRenderer,
     OptimConfig,
+    PatchGuidedDensificationConfig,
+    PatchGuidedDensificationController,
     build_3dgs_optimizer,
     exponential_lr,
     photometric_loss,
@@ -47,7 +50,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-every", type=int, default=50, help="Console log interval.")
     parser.add_argument("--eval-every", type=int, default=500, help="Evaluate held-out test views every N iterations; set 0 to disable.")
     parser.add_argument("--seed", type=int, default=0, help="Random seed.")
+    parser.add_argument(
+        "--densification-mode",
+        default="standard_3dgs",
+        choices=["standard", "standard_3dgs", "patch_guided", "patch_reallocate"],
+        help="Densification strategy. standard and standard_3dgs are the baseline path.",
+    )
     parser.add_argument("--densify-grad-threshold", type=float, default=2.0e-5, help="Screen-space gradient threshold for clone/split.")
+    parser.add_argument("--patch-size", type=int, default=16, help="Patch size for patch-guided densification.")
+    parser.add_argument("--patch-edge-weight", type=float, default=0.75, help="Edge multiplier for patch detail scoring.")
+    parser.add_argument("--patch-detail-lambda", type=float, default=2.0, help="Patch detail multiplier on screen-space gradients.")
+    parser.add_argument("--reallocate-fraction", type=float, default=0.10, help="Low-detail Gaussian fraction to reallocate in patch_reallocate mode.")
+    parser.add_argument("--clone-jitter-scale", type=float, default=0.05, help="Scale-relative position jitter for patch-guided clones.")
     parser.add_argument("--disable-densification", action="store_true", help="Turn off clone/split/prune.")
     return parser.parse_args()
 
@@ -96,18 +110,30 @@ def main() -> None:
     position_lr = exponential_lr(1.6e-4, 1.6e-6, max_steps=args.iterations, delay_steps=1000, delay_mult=0.01)
 
     # densifier 根据屏幕空间梯度动态 clone/split/prune Gaussian，提高细节表达能力。
-    densifier = DensificationController(
-        DensificationConfig(
-            start_step=500,
-            stop_step=max(args.iterations - 500, 501),
-            interval=100,
-            grad_threshold=args.densify_grad_threshold,
-            scene_extent=float(scene.scene_extent),
-            percent_dense=0.01,
-            min_opacity=0.005,
-            opacity_reset_interval=3000,
-        )
+    densify_config = DensificationConfig(
+        start_step=500,
+        stop_step=max(args.iterations - 500, 501),
+        interval=100,
+        grad_threshold=args.densify_grad_threshold,
+        scene_extent=float(scene.scene_extent),
+        percent_dense=0.01,
+        min_opacity=0.005,
+        opacity_reset_interval=3000,
     )
+    uses_patch_densifier = args.densification_mode in {"patch_guided", "patch_reallocate"}
+    if uses_patch_densifier:
+        densifier = PatchGuidedDensificationController(
+            PatchGuidedDensificationConfig(
+                densification=densify_config,
+                patch_size=args.patch_size,
+                edge_weight=args.patch_edge_weight,
+                detail_lambda=args.patch_detail_lambda,
+                reallocate_fraction=args.reallocate_fraction if args.densification_mode == "patch_reallocate" else 0.0,
+                clone_jitter_scale=args.clone_jitter_scale,
+            )
+        )
+    else:
+        densifier = DensificationController(densify_config)
 
     # 把 SceneData 中的每张图封装成 Camera。Camera 内部会按需读取 GT 图像到 GPU。
     train_cameras = build_cameras(scene, device)
@@ -125,6 +151,11 @@ def main() -> None:
     print(
         f"初始 Gaussian 数量：{model.num_gaussians}，训练步数：{args.iterations}，"
         f"启用致密化：{not args.disable_densification}，densify_grad_threshold={args.densify_grad_threshold:g}"
+    )
+    print(
+        f"densification_mode={args.densification_mode} patch_size={args.patch_size} "
+        f"edge_weight={args.patch_edge_weight:g} detail_lambda={args.patch_detail_lambda:g} "
+        f"reallocate_fraction={args.reallocate_fraction:g}"
     )
     print(f"输出目录：{out_dir}")
 
@@ -156,7 +187,10 @@ def main() -> None:
         stats = None
         if not args.disable_densification:
             # 用本轮反传得到的屏幕空间梯度决定是否 clone/split/prune。
-            stats = densifier.update(model, render, optimizer, step)
+            if uses_patch_densifier:
+                stats = densifier.update(model, render, optimizer, step, gt_image)
+            else:
+                stats = densifier.update(model, render, optimizer, step)
 
         if step == 1 or step % args.log_every == 0:
             with torch.no_grad():
@@ -168,8 +202,9 @@ def main() -> None:
             densify_text = ""
             if stats is not None and stats.densified:
                 densify_text = (
-                    f" clone={stats.cloned} split={stats.split} prune={stats.pruned} total={stats.total}"
-                    f" high_grad={stats.high_grad} grad_max={stats.grad_max:.2e}"
+                    f" clone={stats.cloned} split={stats.split} prune={stats.pruned} realloc={stats.reallocated}"
+                    f" total={stats.total} high_grad={stats.high_grad} grad_max={stats.grad_max:.2e}"
+                    f" detail_max={stats.patch_detail_max:.3f}"
                 )
             if stats is not None and stats.opacity_reset:
                 densify_text += " opacity_reset=1"
@@ -197,8 +232,10 @@ def main() -> None:
             save_preview(preview_dir / f"step_{step:06d}.png", render.image)
             save_checkpoint(checkpoint_dir / f"step_{step:06d}.ply", model)
 
+    elapsed = time.perf_counter() - started_at
     save_checkpoint(out_dir / "final.ply", model)
-    print(f"训练完成：最终模型已保存到 {out_dir / 'final.ply'}，总耗时 {format_duration(time.perf_counter() - started_at)}")
+    save_training_summary(out_dir / "training_summary.json", args, data_dir, out_dir, model.num_gaussians, elapsed)
+    print(f"训练完成：最终模型已保存到 {out_dir / 'final.ply'}，总耗时 {format_duration(elapsed)}")
 
 
 def build_cameras(scene, device: torch.device) -> list[Camera]:
@@ -231,6 +268,37 @@ def save_checkpoint(path: Path, model: GaussianModel) -> None:
             model.features_rest.detach().cpu().numpy(),
         )
     write_ply(str(path), data)
+
+
+def save_training_summary(
+    path: Path,
+    args: argparse.Namespace,
+    data_dir: Path,
+    out_dir: Path,
+    final_gaussians: int,
+    elapsed_seconds: float,
+) -> None:
+    """Persist narrow run metadata consumed by benchmark aggregation."""
+    summary = {
+        "data": str(data_dir),
+        "out": str(out_dir),
+        "iterations": int(args.iterations),
+        "factor": int(args.factor),
+        "holdout": int(args.holdout),
+        "seed": int(args.seed),
+        "densification_mode": args.densification_mode,
+        "disable_densification": bool(args.disable_densification),
+        "densify_grad_threshold": float(args.densify_grad_threshold),
+        "patch_size": int(args.patch_size),
+        "patch_edge_weight": float(args.patch_edge_weight),
+        "patch_detail_lambda": float(args.patch_detail_lambda),
+        "reallocate_fraction": float(args.reallocate_fraction),
+        "clone_jitter_scale": float(args.clone_jitter_scale),
+        "final_gaussians": int(final_gaussians),
+        "elapsed_seconds": float(elapsed_seconds),
+    }
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(summary, handle, ensure_ascii=False, indent=2)
 
 
 @torch.no_grad()
