@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import math
+import tempfile
 import unittest
+from pathlib import Path
 
+import numpy as np
 import torch
+from PIL import Image
 
+from methods.semantic_importance import SemanticImportanceProvider
 from modules.densification import (
     DensificationConfig,
+    DensificationController,
     PatchGuidedDensificationConfig,
     PatchGuidedDensificationController,
     _compute_patch_detail,
@@ -29,6 +35,51 @@ class ThreeDGSPatchDensificationTest(unittest.TestCase):
         self.assertGreaterEqual(float(detail.min()), 0.0)
         self.assertLessEqual(float(detail.max()), 1.0)
         self.assertGreater(float(detail[0, 0]), 0.0)
+
+    def test_patch_detail_semantic_weighting_and_validation(self) -> None:
+        render = torch.zeros((3, 8, 8), dtype=torch.float32)
+        gt = torch.zeros_like(render)
+        gt[:, :4, :4] = 1.0
+        gt[:, :4, 4:] = 0.5
+
+        plain = _compute_patch_detail(render, gt, patch_size=4, edge_weight=0.0)
+        all_semantic = torch.ones((8, 8), dtype=torch.float32)
+        weighted_all = _compute_patch_detail(
+            render,
+            gt,
+            patch_size=4,
+            edge_weight=0.0,
+            semantic_importance=all_semantic,
+            semantic_base=0.2,
+        )
+        torch.testing.assert_close(weighted_all, plain)
+
+        zero_semantic = torch.zeros((8, 8), dtype=torch.float32)
+        weighted_zero = _compute_patch_detail(
+            render,
+            gt,
+            patch_size=4,
+            edge_weight=0.0,
+            semantic_importance=zero_semantic,
+            semantic_base=0.2,
+        )
+        torch.testing.assert_close(weighted_zero, plain * 0.2)
+
+        spatial_semantic = torch.ones((8, 8), dtype=torch.float32)
+        spatial_semantic[:4, :4] = 0.0
+        weighted_spatial = _compute_patch_detail(
+            render,
+            gt,
+            patch_size=4,
+            edge_weight=0.0,
+            semantic_importance=spatial_semantic,
+            semantic_base=0.2,
+        )
+        self.assertLess(float(weighted_spatial[0, 0]), float(plain[0, 0]))
+        self.assertGreater(float(weighted_spatial[0, 1]), float(weighted_spatial[0, 0]))
+
+        with self.assertRaises(ValueError):
+            _compute_patch_detail(render, gt, patch_size=4, edge_weight=0.0, semantic_importance=torch.ones((4, 4)))
 
     def test_projection_accumulates_patch_detail_with_boundaries(self) -> None:
         detail = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)
@@ -113,6 +164,49 @@ class ThreeDGSPatchDensificationTest(unittest.TestCase):
         self.assertEqual(stats.cloned, 4)
         self.assertEqual(model.num_gaussians, 8)
         assert_optimizer_lengths(model, optimizer)
+
+    def test_opacity_reset_only_runs_inside_densification_phase(self) -> None:
+        model = make_model(2)
+        optimizer = build_3dgs_optimizer(model)
+        render = RenderOutput(
+            image=torch.zeros((3, 4, 4), dtype=torch.float32),
+            alpha=torch.ones((1, 4, 4), dtype=torch.float32),
+            depth=None,
+            radii=torch.ones(2),
+            means2d=None,
+            metadata={},
+        )
+        controller = DensificationController(
+            DensificationConfig(
+                start_step=1,
+                stop_step=3,
+                interval=0,
+                opacity_reset_interval=3,
+                reset_opacity=0.01,
+            )
+        )
+
+        stats = controller.update(model, render, optimizer, step=3)
+
+        self.assertFalse(stats.opacity_reset)
+        torch.testing.assert_close(model.opacities, torch.full((2,), 0.5))
+
+    def test_semantic_importance_provider_loads_named_mask(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            scene_dir = Path(tmp_dir) / "SceneA"
+            scene_dir.mkdir(parents=True)
+            mask = np.array([[0, 255], [128, 64]], dtype=np.uint8)
+            Image.fromarray(mask).save(scene_dir / "frame_001.png")
+
+            provider = SemanticImportanceProvider(Path(tmp_dir), "SceneA", torch.device("cpu"))
+            loaded = provider.load("/any/path/frame_001.jpg", width=4, height=3)
+
+            self.assertEqual(tuple(loaded.shape), (3, 4))
+            self.assertGreaterEqual(float(loaded.min()), 0.0)
+            self.assertLessEqual(float(loaded.max()), 1.0)
+
+            with self.assertRaises(FileNotFoundError):
+                provider.load("/any/path/missing.jpg", width=4, height=3)
 
     def test_reallocation_keeps_budget_and_optimizer_lengths_consistent(self) -> None:
         model = make_model(8)

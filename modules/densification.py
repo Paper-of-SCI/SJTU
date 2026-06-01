@@ -39,7 +39,7 @@ class DensificationConfig:
     start_step: int = 500
     stop_step: int = 15_000
     interval: int = 100
-    grad_threshold: float = 2.0e-4
+    grad_threshold: float = 2.0e-6
     scene_extent: float = 1.0
     percent_dense: float = 0.01
     min_opacity: float = 0.005
@@ -58,6 +58,7 @@ class PatchGuidedDensificationConfig:
     patch_size: int = 16
     edge_weight: float = 0.75
     detail_lambda: float = 2.0
+    semantic_base: float = 0.2
     reallocate_fraction: float = 0.0
     clone_jitter_scale: float = 0.05
     eps: float = 1.0e-6
@@ -91,7 +92,7 @@ class DensificationController:
         if in_range and self.config.interval > 0 and step % self.config.interval == 0:
             stats = self._densify(model, optimizer, render_output)
 
-        if self.config.opacity_reset_interval > 0 and step > 0 and step % self.config.opacity_reset_interval == 0:
+        if in_range and self.config.opacity_reset_interval > 0 and step > 0 and step % self.config.opacity_reset_interval == 0:
             model.reset_opacities(self.config.reset_opacity)
             _zero_optimizer_state_for(model, optimizer, "logit_opacities")
             stats.opacity_reset = True
@@ -175,6 +176,7 @@ class PatchGuidedDensificationController:
         optimizer: torch.optim.Optimizer,
         step: int,
         gt_image: Tensor,
+        semantic_importance: Optional[Tensor] = None,
     ) -> DensificationStats:
         """Accumulate standard gradients plus patch detail, then optionally mutate Gaussians."""
         base = self.config.densification
@@ -193,6 +195,8 @@ class PatchGuidedDensificationController:
                     gt_image.detach(),
                     patch_size=self.config.patch_size,
                     edge_weight=self.config.edge_weight,
+                    semantic_importance=semantic_importance.detach() if semantic_importance is not None else None,
+                    semantic_base=self.config.semantic_base,
                     eps=self.config.eps,
                 )
                 detail_values, detail_counts = _project_patch_detail_to_gaussians(
@@ -214,7 +218,7 @@ class PatchGuidedDensificationController:
             with torch.no_grad():
                 stats = self._densify(model, optimizer, render_output)
 
-        if base.opacity_reset_interval > 0 and step > 0 and step % base.opacity_reset_interval == 0:
+        if in_range and base.opacity_reset_interval > 0 and step > 0 and step % base.opacity_reset_interval == 0:
             model.reset_opacities(base.reset_opacity)
             _zero_optimizer_state_for(model, optimizer, "logit_opacities")
             stats.opacity_reset = True
@@ -330,7 +334,15 @@ def _standard_prune_mask(model: GaussianModel, render_output: RenderOutput, conf
     return prune_mask
 
 
-def _compute_patch_detail(render_image: Tensor, gt_image: Tensor, patch_size: int, edge_weight: float, eps: float = 1.0e-6) -> Tensor:
+def _compute_patch_detail(
+    render_image: Tensor,
+    gt_image: Tensor,
+    patch_size: int,
+    edge_weight: float,
+    semantic_importance: Optional[Tensor] = None,
+    semantic_base: float = 0.2,
+    eps: float = 1.0e-6,
+) -> Tensor:
     """Return normalized patch detail map with shape ``(patch_h, patch_w)``."""
     if render_image.shape != gt_image.shape:
         raise ValueError("render_image and gt_image must have the same CHW shape")
@@ -345,7 +357,24 @@ def _compute_patch_detail(render_image: Tensor, gt_image: Tensor, patch_size: in
     patch_error = _normalize_minmax(patch_error, eps)
     patch_edge = _normalize_minmax(patch_edge, eps)
     detail = patch_error * (1.0 + float(edge_weight) * patch_edge)
-    return _normalize_minmax(detail.squeeze(0).squeeze(0), eps)
+    detail = _normalize_minmax(detail, eps)
+
+    if semantic_importance is not None:
+        semantic = _validate_semantic_importance(semantic_importance, gt.shape[-2], gt.shape[-1]).to(device=gt.device, dtype=gt.dtype)
+        patch_semantic = _patch_pool(semantic.unsqueeze(0).unsqueeze(0), patch).clamp(0.0, 1.0)
+        semantic_floor = min(max(float(semantic_base), 0.0), 1.0)
+        semantic_factor = semantic_floor + (1.0 - semantic_floor) * patch_semantic
+        detail = detail * semantic_factor
+
+    return detail.squeeze(0).squeeze(0)
+
+
+def _validate_semantic_importance(semantic_importance: Tensor, height: int, width: int) -> Tensor:
+    if semantic_importance.ndim != 2:
+        raise ValueError("semantic_importance must be an HW tensor")
+    if int(semantic_importance.shape[-2]) != int(height) or int(semantic_importance.shape[-1]) != int(width):
+        raise ValueError("semantic_importance must have HW shape matching gt_image")
+    return semantic_importance.detach().clamp(0.0, 1.0)
 
 
 def _patch_pool(image_bchw: Tensor, patch_size: int) -> Tensor:

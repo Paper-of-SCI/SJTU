@@ -36,17 +36,20 @@ def load_colmap_dataset(
     split: str = "train",
     load_images: bool = True,
     factor: int = 1,
+    target_height: int = 0,
+    target_width: int = 0,
     holdout: int = 8,
+    holdout_offset: int = 0,
     opengl: bool = True,
 ) -> SceneData:
     """Load a COLMAP scene from ``data_dir/sparse/0``."""
     cameras, images, points = read_colmap_model(os.path.join(data_dir, "sparse", "0"))
     ids = sorted(images.keys(), key=lambda item: images[item].name)
-    ids = _split_indices(ids, split, holdout)
+    ids = _split_indices(ids, split, holdout, holdout_offset)
     if not ids:
         raise ValueError(f"empty {split} split for {data_dir}")
 
-    image_dir = _find_image_dir(data_dir, factor)
+    image_dir = _find_image_dir(data_dir, 1 if target_height > 0 or target_width > 0 else factor)
     c2ws = []
     paths = []
     fxs, fys, cxs, cys = [], [], [], []
@@ -54,12 +57,11 @@ def load_colmap_dataset(
     for image_id in ids:
         image = images[image_id]
         camera = cameras[image.camera_id]
-        width = max(int(camera.width // factor), 1)
-        height = max(int(camera.height // factor), 1)
-        fxs.append(camera.fx / factor)
-        fys.append(camera.fy / factor)
-        cxs.append(camera.cx / factor)
-        cys.append(camera.cy / factor)
+        width, height, scale = _scaled_resolution(int(camera.width), int(camera.height), factor, target_height, target_width)
+        fxs.append(camera.fx * scale)
+        fys.append(camera.fy * scale)
+        cxs.append(camera.cx * scale)
+        cys.append(camera.cy * scale)
         c2ws.append(colmap_image_to_c2w(image.qvec, image.tvec, opengl=opengl))
         paths.append(os.path.join(image_dir, image.name))
 
@@ -91,12 +93,24 @@ def load_llff_dataset(
     split: str = "train",
     load_images: bool = True,
     factor: int = 1,
+    target_height: int = 0,
+    target_width: int = 0,
     holdout: int = 8,
+    holdout_offset: int = 0,
 ) -> SceneData:
     """Load LLFF ``poses_bounds.npy`` data, with COLMAP fallback for point cloud."""
     poses_path = os.path.join(data_dir, "poses_bounds.npy")
     if not os.path.exists(poses_path):
-        return load_colmap_dataset(data_dir, split=split, load_images=load_images, factor=factor, holdout=holdout)
+        return load_colmap_dataset(
+            data_dir,
+            split=split,
+            load_images=load_images,
+            factor=factor,
+            target_height=target_height,
+            target_width=target_width,
+            holdout=holdout,
+            holdout_offset=holdout_offset,
+        )
 
     poses_bounds = np.load(poses_path)
     poses = poses_bounds[:, :15].reshape(-1, 3, 5)
@@ -106,13 +120,12 @@ def load_llff_dataset(
     c2w = c2w @ np.diag([1.0, -1.0, -1.0, 1.0])
     c2w = np.concatenate([c2w, np.broadcast_to(np.array([0, 0, 0, 1.0]), (len(c2w), 1, 4))], axis=1)
 
-    image_dir = _find_image_dir(data_dir, factor)
+    image_dir = _find_image_dir(data_dir, 1 if target_height > 0 or target_width > 0 else factor)
     names = sorted(name for name in os.listdir(image_dir) if name.lower().endswith((".png", ".jpg", ".jpeg")))
     count = min(len(names), len(c2w))
-    indices = _split_indices(list(range(count)), split, holdout)
-    height = max(int(hwf[0, 0] // factor), 1)
-    width = max(int(hwf[0, 1] // factor), 1)
-    focal = hwf[:count, 2] / factor
+    indices = _split_indices(list(range(count)), split, holdout, holdout_offset)
+    width, height, scale = _scaled_resolution(int(hwf[0, 1]), int(hwf[0, 0]), factor, target_height, target_width)
+    focal = hwf[:count, 2] * scale
     paths = [os.path.join(image_dir, names[i]) for i in indices]
     loaded = _load_images(paths, width, height) if load_images else None
     selected_c2w = c2w[indices]
@@ -135,10 +148,27 @@ def load_llff_dataset(
     )
 
 
-def _split_indices(values: list, split: str, holdout: int) -> list:
+def _split_indices(values: list, split: str, holdout: int, holdout_offset: int = 0) -> list:
+    offset = int(holdout_offset)
     if split in {"test", "val"}:
-        return [value for i, value in enumerate(values) if holdout > 0 and i % holdout == 0]
-    return [value for i, value in enumerate(values) if holdout <= 0 or i % holdout != 0]
+        return [value for i, value in enumerate(values) if holdout > 0 and (i - offset) % holdout == 0]
+    return [value for i, value in enumerate(values) if holdout <= 0 or (i - offset) % holdout != 0]
+
+
+def _scaled_resolution(width: int, height: int, factor: int, target_height: int = 0, target_width: int = 0) -> tuple[int, int, float]:
+    if width <= 0 or height <= 0:
+        raise ValueError(f"图像尺寸非法: {width}x{height}")
+    if target_height > 0 and target_width > 0:
+        raise ValueError("target_height 和 target_width 只能设置一个")
+    if target_height > 0:
+        scale = float(target_height) / float(height)
+        return max(int(round(width * scale)), 1), max(int(target_height), 1), scale
+    if target_width > 0:
+        scale = float(target_width) / float(width)
+        return max(int(target_width), 1), max(int(round(height * scale)), 1), scale
+    safe_factor = max(int(factor), 1)
+    scale = 1.0 / float(safe_factor)
+    return max(int(width // safe_factor), 1), max(int(height // safe_factor), 1), scale
 
 
 def _find_image_dir(data_dir: str, factor: int) -> str:

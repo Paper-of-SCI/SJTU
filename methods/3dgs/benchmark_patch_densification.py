@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_DENSIFY_GRAD_THRESHOLD = 2.0e-6
 
 
 def parse_args() -> argparse.Namespace:
@@ -20,21 +21,37 @@ def parse_args() -> argparse.Namespace:
         "--variants",
         nargs="+",
         default=["standard_3dgs", "patch_guided", "patch_reallocate"],
-        choices=["standard", "standard_3dgs", "patch_guided", "patch_reallocate"],
+        choices=["standard", "standard_3dgs", "patch_guided", "patch_guided_semantic", "patch_reallocate"],
         help="Densification variants to compare.",
     )
     parser.add_argument("--seeds", nargs="+", type=int, default=[0], help="Random seeds.")
     parser.add_argument("--iterations", type=int, default=7000, help="Training iterations per run.")
     parser.add_argument("--factor", type=int, default=4, help="Image downscale factor.")
+    parser.add_argument("--target-height", type=int, default=0, help="Resize images to this height while preserving aspect ratio; 0 uses --factor.")
+    parser.add_argument("--target-width", type=int, default=0, help="Resize images to this width while preserving aspect ratio; 0 uses --target-height or --factor.")
     parser.add_argument("--holdout", type=int, default=8, help="Holdout interval.")
+    parser.add_argument("--holdout-offset", type=int, default=0, help="Offset used when selecting every Nth held-out image.")
     parser.add_argument("--lpips", action="store_true", help="Compute LPIPS during test rendering.")
+    parser.add_argument("--lpips-net", default="vgg", choices=["alex", "vgg", "squeeze"], help="LPIPS backbone used when --lpips is enabled.")
+    parser.add_argument("--lpips-backend", default="lpips", choices=["lpips", "official_3dgs"], help="LPIPS implementation forwarded to rendering.")
     parser.add_argument("--out", default="outputs/3dgs_patch_curasao", help="Benchmark output directory.")
     parser.add_argument("--data-root", default="src/datasets/SeathruNeRF_dataset", help="Root directory for named scenes.")
     parser.add_argument("--log-every", type=int, default=100, help="Training log interval.")
-    parser.add_argument("--densify-grad-threshold", type=float, default=2.0e-5, help="Shared densification gradient threshold.")
+    parser.add_argument(
+        "--densify-grad-threshold",
+        type=float,
+        default=DEFAULT_DENSIFY_GRAD_THRESHOLD,
+        help="Shared densification gradient threshold; default is calibrated for this gsplat training path.",
+    )
+    parser.add_argument("--densify-start-step", type=int, default=500, help="First iteration that may run densification.")
+    parser.add_argument("--densify-stop-step", type=int, default=0, help="Densification phase boundary forwarded to training; 0 uses training default.")
+    parser.add_argument("--densify-interval", type=int, default=100, help="Densification interval forwarded to training.")
+    parser.add_argument("--opacity-reset-interval", type=int, default=3000, help="Opacity reset interval during the densification phase.")
     parser.add_argument("--patch-size", type=int, default=16, help="Patch size for patch-guided variants.")
     parser.add_argument("--patch-edge-weight", type=float, default=0.75, help="Edge multiplier for patch detail scoring.")
     parser.add_argument("--patch-detail-lambda", type=float, default=2.0, help="Patch detail multiplier on gradients.")
+    parser.add_argument("--semantic-importance-root", default="", help="Root directory for semantic importance masks.")
+    parser.add_argument("--semantic-base", type=float, default=0.2, help="Minimum semantic multiplier for patch_guided_semantic.")
     parser.add_argument("--reallocate-fraction", type=float, default=0.10, help="Low-detail Gaussian fraction reallocated.")
     parser.add_argument("--clone-jitter-scale", type=float, default=0.05, help="Scale-relative jitter for patch-guided clones.")
     parser.add_argument("--skip-existing", action="store_true", help="Reuse runs whose final.ply and metrics.csv already exist.")
@@ -43,6 +60,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if "patch_guided_semantic" in args.variants and not args.semantic_importance_root:
+        raise ValueError("patch_guided_semantic 需要传入 --semantic-importance-root")
     out_dir = resolve_output_path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     rows: list[dict] = []
@@ -85,20 +104,38 @@ def run_variant(args: argparse.Namespace, data_dir: Path, scene_name: str, varia
         str(args.iterations),
         "--factor",
         str(args.factor),
+        "--target-height",
+        str(args.target_height),
+        "--target-width",
+        str(args.target_width),
         "--holdout",
         str(args.holdout),
+        "--holdout-offset",
+        str(args.holdout_offset),
         "--seed",
         str(seed),
         "--densification-mode",
         variant,
         "--densify-grad-threshold",
         str(args.densify_grad_threshold),
+        "--densify-start-step",
+        str(args.densify_start_step),
+        "--densify-stop-step",
+        str(args.densify_stop_step),
+        "--densify-interval",
+        str(args.densify_interval),
+        "--opacity-reset-interval",
+        str(args.opacity_reset_interval),
         "--patch-size",
         str(args.patch_size),
         "--patch-edge-weight",
         str(args.patch_edge_weight),
         "--patch-detail-lambda",
         str(args.patch_detail_lambda),
+        "--semantic-importance-root",
+        str(args.semantic_importance_root),
+        "--semantic-base",
+        str(args.semantic_base),
         "--reallocate-fraction",
         str(args.reallocate_fraction),
         "--clone-jitter-scale",
@@ -128,11 +165,17 @@ def run_variant(args: argparse.Namespace, data_dir: Path, scene_name: str, varia
         "test",
         "--factor",
         str(args.factor),
+        "--target-height",
+        str(args.target_height),
+        "--target-width",
+        str(args.target_width),
         "--holdout",
         str(args.holdout),
+        "--holdout-offset",
+        str(args.holdout_offset),
     ]
     if args.lpips:
-        render_cmd.append("--lpips")
+        render_cmd.extend(["--lpips", "--lpips-net", str(args.lpips_net), "--lpips-backend", str(args.lpips_backend)])
     run_command(render_cmd)
     if not metrics_csv.exists():
         raise FileNotFoundError(f"测试渲染未生成 metrics.csv: {metrics_csv}")
@@ -166,7 +209,25 @@ def build_summary_row(
         "seed": seed,
         "iterations": int(args.iterations),
         "factor": int(args.factor),
+        "target_height": int(args.target_height),
+        "target_width": int(args.target_width),
         "holdout": int(args.holdout),
+        "holdout_offset": int(args.holdout_offset),
+        "lpips_net": str(args.lpips_net) if args.lpips else "",
+        "lpips_backend": str(args.lpips_backend) if args.lpips else "",
+        "patch_size": int(args.patch_size),
+        "patch_edge_weight": float(args.patch_edge_weight),
+        "patch_detail_lambda": float(args.patch_detail_lambda),
+        "semantic_importance_root": training.get("semantic_importance_root"),
+        "semantic_base": training.get("semantic_base"),
+        "uses_semantic_importance": training.get("uses_semantic_importance"),
+        "reallocate_fraction": float(args.reallocate_fraction),
+        "densify_grad_threshold": float(args.densify_grad_threshold),
+        "densify_start_step": training.get("densify_start_step"),
+        "densify_stop_step": training.get("densify_stop_step"),
+        "effective_densify_stop_step": training.get("effective_densify_stop_step"),
+        "densify_interval": training.get("densify_interval"),
+        "opacity_reset_interval": training.get("opacity_reset_interval"),
         "psnr": metrics.get("psnr"),
         "ssim": metrics.get("ssim"),
         "l1": metrics.get("l1"),
@@ -211,7 +272,25 @@ def write_summary(out_dir: Path, rows: list[dict]) -> None:
         "seed",
         "iterations",
         "factor",
+        "target_height",
+        "target_width",
         "holdout",
+        "holdout_offset",
+        "lpips_net",
+        "lpips_backend",
+        "patch_size",
+        "patch_edge_weight",
+        "patch_detail_lambda",
+        "semantic_importance_root",
+        "semantic_base",
+        "uses_semantic_importance",
+        "reallocate_fraction",
+        "densify_grad_threshold",
+        "densify_start_step",
+        "densify_stop_step",
+        "effective_densify_stop_step",
+        "densify_interval",
+        "opacity_reset_interval",
         "psnr",
         "ssim",
         "l1",

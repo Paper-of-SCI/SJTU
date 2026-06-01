@@ -18,6 +18,9 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+DEFAULT_DENSIFY_STOP_STEP = 15_000
+DEFAULT_DENSIFY_GRAD_THRESHOLD = 2.0e-6
+
 from modules import (
     Camera,
     DensificationConfig,
@@ -32,6 +35,7 @@ from modules import (
     photometric_loss,
     set_group_lr,
 )
+from methods.semantic_importance import SemanticImportanceProvider
 from utils.dataset_loaders import load_colmap_dataset
 from utils.image_utils import compute_psnr, save_image
 from utils.ply_io import gaussians_to_ply_dict, write_ply
@@ -43,7 +47,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out", default="outputs/3dgs_scene", help="Output directory.")
     parser.add_argument("--iterations", type=int, default=7000, help="Training iterations.")
     parser.add_argument("--factor", type=int, default=4, help="Image downscale factor for training.")
+    parser.add_argument("--target-height", type=int, default=0, help="Resize images to this height while preserving aspect ratio; 0 uses --factor.")
+    parser.add_argument("--target-width", type=int, default=0, help="Resize images to this width while preserving aspect ratio; 0 uses --target-height or --factor.")
     parser.add_argument("--holdout", type=int, default=8, help="Every Nth image is held out by the loader.")
+    parser.add_argument("--holdout-offset", type=int, default=0, help="Offset used when selecting every Nth held-out image.")
     parser.add_argument("--sh-degree", type=int, default=3, help="Maximum spherical harmonics degree.")
     parser.add_argument("--lambda-dssim", type=float, default=0.2, help="Photometric DSSIM weight.")
     parser.add_argument("--save-every", type=int, default=1000, help="Save preview/checkpoint interval.")
@@ -53,13 +60,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--densification-mode",
         default="standard_3dgs",
-        choices=["standard", "standard_3dgs", "patch_guided", "patch_reallocate"],
+        choices=["standard", "standard_3dgs", "patch_guided", "patch_guided_semantic", "patch_reallocate"],
         help="Densification strategy. standard and standard_3dgs are the baseline path.",
     )
-    parser.add_argument("--densify-grad-threshold", type=float, default=2.0e-5, help="Screen-space gradient threshold for clone/split.")
+    parser.add_argument(
+        "--densify-grad-threshold",
+        type=float,
+        default=DEFAULT_DENSIFY_GRAD_THRESHOLD,
+        help="Screen-space gradient threshold for clone/split; default is calibrated for this gsplat training path.",
+    )
+    parser.add_argument("--densify-start-step", type=int, default=500, help="First iteration that may run densification.")
+    parser.add_argument("--densify-stop-step", type=int, default=0, help="Densification phase boundary; 0 uses an official-3DGS-style default.")
+    parser.add_argument("--densify-interval", type=int, default=100, help="Densification interval in iterations.")
+    parser.add_argument("--opacity-reset-interval", type=int, default=3000, help="Opacity reset interval during the densification phase; 0 disables resets.")
     parser.add_argument("--patch-size", type=int, default=16, help="Patch size for patch-guided densification.")
     parser.add_argument("--patch-edge-weight", type=float, default=0.75, help="Edge multiplier for patch detail scoring.")
     parser.add_argument("--patch-detail-lambda", type=float, default=2.0, help="Patch detail multiplier on screen-space gradients.")
+    parser.add_argument("--semantic-importance-root", default="", help="Root directory for per-image semantic importance masks.")
+    parser.add_argument("--semantic-base", type=float, default=0.2, help="Minimum semantic multiplier for patch-guided semantic densification.")
     parser.add_argument("--reallocate-fraction", type=float, default=0.10, help="Low-detail Gaussian fraction to reallocate in patch_reallocate mode.")
     parser.add_argument("--clone-jitter-scale", type=float, default=0.05, help="Scale-relative position jitter for patch-guided clones.")
     parser.add_argument("--disable-densification", action="store_true", help="Turn off clone/split/prune.")
@@ -87,8 +105,28 @@ def main() -> None:
 
     # 读取 COLMAP 数据：相机内参、相机位姿、图像路径、稀疏点云。
     # opengl=False 表示保留 COLMAP/OpenCV 相机坐标约定，和当前 gsplat 投影链路一致。
-    scene = load_colmap_dataset(str(data_dir), split="train", load_images=False, factor=args.factor, holdout=args.holdout, opengl=False)
-    test_scene = load_colmap_dataset(str(data_dir), split="test", load_images=False, factor=args.factor, holdout=args.holdout, opengl=False)
+    scene = load_colmap_dataset(
+        str(data_dir),
+        split="train",
+        load_images=False,
+        factor=args.factor,
+        target_height=args.target_height,
+        target_width=args.target_width,
+        holdout=args.holdout,
+        holdout_offset=args.holdout_offset,
+        opengl=False,
+    )
+    test_scene = load_colmap_dataset(
+        str(data_dir),
+        split="test",
+        load_images=False,
+        factor=args.factor,
+        target_height=args.target_height,
+        target_width=args.target_width,
+        holdout=args.holdout,
+        holdout_offset=args.holdout_offset,
+        opengl=False,
+    )
     if scene.point_cloud_xyz is None or scene.point_cloud_rgb is None:
         raise RuntimeError("训练需要 COLMAP 点云初始化 GaussianModel。")
 
@@ -109,18 +147,29 @@ def main() -> None:
     # 位置学习率单独做指数衰减：前期让 Gaussian 多移动，后期收小步长精修。
     position_lr = exponential_lr(1.6e-4, 1.6e-6, max_steps=args.iterations, delay_steps=1000, delay_mult=0.01)
 
+    uses_semantic_importance = args.densification_mode == "patch_guided_semantic"
+    semantic_importance_root = ""
+    semantic_provider = None
+    if uses_semantic_importance:
+        if not args.semantic_importance_root:
+            raise ValueError("patch_guided_semantic 需要传入 --semantic-importance-root")
+        semantic_root = resolve_input_path(args.semantic_importance_root)
+        semantic_importance_root = str(semantic_root)
+        semantic_provider = SemanticImportanceProvider(semantic_root, data_dir.name, device)
+
     # densifier 根据屏幕空间梯度动态 clone/split/prune Gaussian，提高细节表达能力。
+    effective_densify_stop_step = resolve_densify_stop_step(args.iterations, args.densify_stop_step)
     densify_config = DensificationConfig(
-        start_step=500,
-        stop_step=max(args.iterations - 500, 501),
-        interval=100,
+        start_step=max(int(args.densify_start_step), 0),
+        stop_step=effective_densify_stop_step,
+        interval=max(int(args.densify_interval), 0),
         grad_threshold=args.densify_grad_threshold,
         scene_extent=float(scene.scene_extent),
         percent_dense=0.01,
         min_opacity=0.005,
-        opacity_reset_interval=3000,
+        opacity_reset_interval=max(int(args.opacity_reset_interval), 0),
     )
-    uses_patch_densifier = args.densification_mode in {"patch_guided", "patch_reallocate"}
+    uses_patch_densifier = args.densification_mode in {"patch_guided", "patch_guided_semantic", "patch_reallocate"}
     if uses_patch_densifier:
         densifier = PatchGuidedDensificationController(
             PatchGuidedDensificationConfig(
@@ -128,6 +177,7 @@ def main() -> None:
                 patch_size=args.patch_size,
                 edge_weight=args.patch_edge_weight,
                 detail_lambda=args.patch_detail_lambda,
+                semantic_base=args.semantic_base,
                 reallocate_fraction=args.reallocate_fraction if args.densification_mode == "patch_reallocate" else 0.0,
                 clone_jitter_scale=args.clone_jitter_scale,
             )
@@ -146,17 +196,24 @@ def main() -> None:
     print(f"数据集：{data_dir}")
     print(
         f"数据划分：训练={len(train_cameras)} 张，测试={len(test_cameras)} 张，"
-        f"holdout={args.holdout}，分辨率={scene.width}x{scene.height}，降采样 factor={args.factor}"
+        f"holdout={args.holdout}，holdout_offset={args.holdout_offset}，分辨率={scene.width}x{scene.height}，"
+        f"target_height={args.target_height}，target_width={args.target_width}，降采样 factor={args.factor}"
     )
     print(
         f"初始 Gaussian 数量：{model.num_gaussians}，训练步数：{args.iterations}，"
         f"启用致密化：{not args.disable_densification}，densify_grad_threshold={args.densify_grad_threshold:g}"
     )
     print(
+        f"densify_start_step={densify_config.start_step} densify_stop_step={densify_config.stop_step} "
+        f"densify_interval={densify_config.interval} opacity_reset_interval={densify_config.opacity_reset_interval}"
+    )
+    print(
         f"densification_mode={args.densification_mode} patch_size={args.patch_size} "
         f"edge_weight={args.patch_edge_weight:g} detail_lambda={args.patch_detail_lambda:g} "
-        f"reallocate_fraction={args.reallocate_fraction:g}"
+        f"semantic_base={args.semantic_base:g} reallocate_fraction={args.reallocate_fraction:g}"
     )
+    if uses_semantic_importance:
+        print(f"semantic_importance_root={semantic_importance_root}")
     print(f"输出目录：{out_dir}")
 
     started_at = time.perf_counter()
@@ -188,7 +245,10 @@ def main() -> None:
         if not args.disable_densification:
             # 用本轮反传得到的屏幕空间梯度决定是否 clone/split/prune。
             if uses_patch_densifier:
-                stats = densifier.update(model, render, optimizer, step, gt_image)
+                semantic_importance = None
+                if semantic_provider is not None:
+                    semantic_importance = semantic_provider.load(camera.image_path, camera.width, camera.height)
+                stats = densifier.update(model, render, optimizer, step, gt_image, semantic_importance=semantic_importance)
             else:
                 stats = densifier.update(model, render, optimizer, step)
 
@@ -284,14 +344,29 @@ def save_training_summary(
         "out": str(out_dir),
         "iterations": int(args.iterations),
         "factor": int(args.factor),
+        "target_height": int(args.target_height),
+        "target_width": int(args.target_width),
         "holdout": int(args.holdout),
+        "holdout_offset": int(args.holdout_offset),
         "seed": int(args.seed),
         "densification_mode": args.densification_mode,
         "disable_densification": bool(args.disable_densification),
         "densify_grad_threshold": float(args.densify_grad_threshold),
+        "densify_start_step": int(args.densify_start_step),
+        "densify_stop_step": int(args.densify_stop_step),
+        "effective_densify_stop_step": int(resolve_densify_stop_step(args.iterations, args.densify_stop_step)),
+        "densify_interval": int(args.densify_interval),
+        "opacity_reset_interval": int(args.opacity_reset_interval),
         "patch_size": int(args.patch_size),
         "patch_edge_weight": float(args.patch_edge_weight),
         "patch_detail_lambda": float(args.patch_detail_lambda),
+        "semantic_importance_root": (
+            str(resolve_input_path(args.semantic_importance_root))
+            if args.semantic_importance_root and args.densification_mode == "patch_guided_semantic"
+            else ""
+        ),
+        "semantic_base": float(args.semantic_base),
+        "uses_semantic_importance": bool(args.densification_mode == "patch_guided_semantic"),
         "reallocate_fraction": float(args.reallocate_fraction),
         "clone_jitter_scale": float(args.clone_jitter_scale),
         "final_gaussians": int(final_gaussians),
@@ -344,6 +419,13 @@ def resolve_output_path(path: str) -> Path:
     if candidate.is_absolute():
         return candidate
     return ROOT / candidate
+
+
+def resolve_densify_stop_step(iterations: int, requested_stop_step: int) -> int:
+    """Return the exclusive stop boundary for densification and opacity resets."""
+    if requested_stop_step > 0:
+        return int(requested_stop_step)
+    return max(min(int(iterations) - 500, DEFAULT_DENSIFY_STOP_STEP), 501)
 
 
 if __name__ == "__main__":
