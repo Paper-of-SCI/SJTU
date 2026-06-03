@@ -22,6 +22,8 @@ DEFAULT_DENSIFY_STOP_STEP = 15_000
 DEFAULT_DENSIFY_GRAD_THRESHOLD = 2.0e-6
 
 from modules import (
+    BestMetricTracker,
+    DENSIFICATION_MODE_CHOICES,
     Camera,
     DensificationConfig,
     DensificationController,
@@ -30,10 +32,18 @@ from modules import (
     OptimConfig,
     PatchGuidedDensificationConfig,
     PatchGuidedDensificationController,
+    build_lpips_evaluator,
     build_3dgs_optimizer,
+    evaluate_cameras,
     exponential_lr,
+    flatten_best_metric_fields,
+    normalize_densification_mode,
     photometric_loss,
     set_group_lr,
+    uses_patch_densifier,
+    uses_reallocation,
+    uses_semantic_importance,
+    validate_semantic_importance_root,
 )
 from methods.semantic_importance import SemanticImportanceProvider
 from utils.dataset_loaders import load_colmap_dataset
@@ -60,7 +70,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--densification-mode",
         default="standard_3dgs",
-        choices=["standard", "standard_3dgs", "patch_guided", "patch_guided_semantic", "patch_reallocate"],
+        choices=list(DENSIFICATION_MODE_CHOICES),
         help="Densification strategy. standard and standard_3dgs are the baseline path.",
     )
     parser.add_argument(
@@ -77,15 +87,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patch-edge-weight", type=float, default=0.75, help="Edge multiplier for patch detail scoring.")
     parser.add_argument("--patch-detail-lambda", type=float, default=2.0, help="Patch detail multiplier on screen-space gradients.")
     parser.add_argument("--semantic-importance-root", default="", help="Root directory for per-image semantic importance masks.")
-    parser.add_argument("--semantic-base", type=float, default=0.2, help="Minimum semantic multiplier for patch-guided semantic densification.")
-    parser.add_argument("--reallocate-fraction", type=float, default=0.10, help="Low-detail Gaussian fraction to reallocate in patch_reallocate mode.")
+    parser.add_argument("--semantic-base", type=float, default=0.2, help="Minimum semantic multiplier for semantic patch-guided densification.")
+    parser.add_argument("--reallocate-fraction", type=float, default=0.10, help="Low-detail Gaussian fraction to reallocate in patch_reallocate modes.")
     parser.add_argument("--clone-jitter-scale", type=float, default=0.05, help="Scale-relative position jitter for patch-guided clones.")
+    parser.add_argument("--eval-lpips", action="store_true", help="Compute LPIPS during held-out training evaluation.")
+    parser.add_argument("--lpips-net", default="vgg", choices=["alex", "vgg", "squeeze"], help="LPIPS backbone used when --eval-lpips is enabled.")
+    parser.add_argument(
+        "--lpips-backend",
+        default="lpips",
+        choices=["lpips", "official_3dgs"],
+        help="LPIPS implementation used during held-out training evaluation.",
+    )
     parser.add_argument("--disable-densification", action="store_true", help="Turn off clone/split/prune.")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    args.densification_mode = normalize_densification_mode(args.densification_mode)
+    validate_semantic_importance_root([args.densification_mode], args.semantic_importance_root)
     if not torch.cuda.is_available():
         raise RuntimeError("当前训练脚本需要 CUDA；gsplat 渲染训练建议在 GPU 上运行。")
 
@@ -100,8 +120,11 @@ def main() -> None:
     out_dir = resolve_output_path(args.out)
     preview_dir = out_dir / "previews"
     checkpoint_dir = out_dir / "checkpoints"
-    preview_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    best_dir = out_dir / "best"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if args.save_every > 0:
+        preview_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     # 读取 COLMAP 数据：相机内参、相机位姿、图像路径、稀疏点云。
     # opengl=False 表示保留 COLMAP/OpenCV 相机坐标约定，和当前 gsplat 投影链路一致。
@@ -147,12 +170,10 @@ def main() -> None:
     # 位置学习率单独做指数衰减：前期让 Gaussian 多移动，后期收小步长精修。
     position_lr = exponential_lr(1.6e-4, 1.6e-6, max_steps=args.iterations, delay_steps=1000, delay_mult=0.01)
 
-    uses_semantic_importance = args.densification_mode == "patch_guided_semantic"
+    semantic_enabled = uses_semantic_importance(args.densification_mode)
     semantic_importance_root = ""
     semantic_provider = None
-    if uses_semantic_importance:
-        if not args.semantic_importance_root:
-            raise ValueError("patch_guided_semantic 需要传入 --semantic-importance-root")
+    if semantic_enabled:
         semantic_root = resolve_input_path(args.semantic_importance_root)
         semantic_importance_root = str(semantic_root)
         semantic_provider = SemanticImportanceProvider(semantic_root, data_dir.name, device)
@@ -169,8 +190,9 @@ def main() -> None:
         min_opacity=0.005,
         opacity_reset_interval=max(int(args.opacity_reset_interval), 0),
     )
-    uses_patch_densifier = args.densification_mode in {"patch_guided", "patch_guided_semantic", "patch_reallocate"}
-    if uses_patch_densifier:
+    patch_densifier_enabled = uses_patch_densifier(args.densification_mode)
+    effective_reallocate_fraction = args.reallocate_fraction if uses_reallocation(args.densification_mode) else 0.0
+    if patch_densifier_enabled:
         densifier = PatchGuidedDensificationController(
             PatchGuidedDensificationConfig(
                 densification=densify_config,
@@ -178,7 +200,7 @@ def main() -> None:
                 edge_weight=args.patch_edge_weight,
                 detail_lambda=args.patch_detail_lambda,
                 semantic_base=args.semantic_base,
-                reallocate_fraction=args.reallocate_fraction if args.densification_mode == "patch_reallocate" else 0.0,
+                reallocate_fraction=effective_reallocate_fraction,
                 clone_jitter_scale=args.clone_jitter_scale,
             )
         )
@@ -188,6 +210,12 @@ def main() -> None:
     # 把 SceneData 中的每张图封装成 Camera。Camera 内部会按需读取 GT 图像到 GPU。
     train_cameras = build_cameras(scene, device)
     test_cameras = build_cameras(test_scene, device)
+    eval_lpips_enabled = bool(args.eval_lpips and args.eval_every > 0)
+    lpips_evaluator = build_lpips_evaluator(device, args.lpips_net, args.lpips_backend) if eval_lpips_enabled else None
+    best_tracker = BestMetricTracker(include_lpips=eval_lpips_enabled) if args.eval_every > 0 else None
+    best_metrics_path = out_dir / "best_metrics.json"
+    if best_tracker is not None:
+        best_dir.mkdir(parents=True, exist_ok=True)
     camera_indices = list(range(len(train_cameras)))
     viewpoint_stack: list[int] = []
     gpu_name = torch.cuda.get_device_name(device)
@@ -210,10 +238,14 @@ def main() -> None:
     print(
         f"densification_mode={args.densification_mode} patch_size={args.patch_size} "
         f"edge_weight={args.patch_edge_weight:g} detail_lambda={args.patch_detail_lambda:g} "
-        f"semantic_base={args.semantic_base:g} reallocate_fraction={args.reallocate_fraction:g}"
+        f"semantic_base={args.semantic_base:g} reallocate_fraction={effective_reallocate_fraction:g}"
     )
-    if uses_semantic_importance:
+    if semantic_enabled:
         print(f"semantic_importance_root={semantic_importance_root}")
+    print(
+        f"heldout_eval_every={args.eval_every} eval_lpips={eval_lpips_enabled} "
+        f"lpips_backend={args.lpips_backend if eval_lpips_enabled else ''}"
+    )
     print(f"输出目录：{out_dir}")
 
     started_at = time.perf_counter()
@@ -244,7 +276,7 @@ def main() -> None:
         stats = None
         if not args.disable_densification:
             # 用本轮反传得到的屏幕空间梯度决定是否 clone/split/prune。
-            if uses_patch_densifier:
+            if patch_densifier_enabled:
                 semantic_importance = None
                 if semantic_provider is not None:
                     semantic_importance = semantic_provider.load(camera.image_path, camera.width, camera.height)
@@ -282,19 +314,37 @@ def main() -> None:
                 f"训练PSNR={psnr:.2f} | Gaussian={model.num_gaussians}{densify_text}"
             )
 
-        if args.eval_every > 0 and (step == 1 or step % args.eval_every == 0 or step == args.iterations):
-            # 测试集评估不反传，只衡量 held-out 视角渲染质量。
-            eval_psnr = evaluate_psnr(model, renderer, test_cameras)
-            tqdm.write(f"测试评估 | 第 {step:06d} 步 | 测试图像={len(test_cameras)} | 测试PSNR={eval_psnr:.2f}")
+        if best_tracker is not None and (step % args.eval_every == 0 or step == args.iterations):
+            # 测试集评估不反传，只衡量 held-out 视角渲染质量，并保存各指标最优 checkpoint。
+            eval_metrics = evaluate_cameras(model, renderer, test_cameras, lpips_evaluator)
+            improved = best_tracker.update(step, eval_metrics)
+            for metric_name in improved:
+                best_checkpoint = best_dir / f"best_{metric_name}.ply"
+                save_checkpoint(best_checkpoint, model)
+                best_tracker.set_checkpoint(metric_name, str(best_checkpoint))
+            save_best_metrics(best_metrics_path, best_tracker.to_dict())
+            improved_text = ",".join(improved) if improved else "-"
+            tqdm.write(
+                f"测试评估 | 第 {step:06d} 步 | 测试图像={len(test_cameras)} | "
+                f"{format_eval_metrics(eval_metrics)} | best更新={improved_text}"
+            )
 
-        if step == 1 or step % args.save_every == 0 or step == args.iterations:
+        if should_save_training_artifacts(step, args.iterations, args.save_every):
             # 保存当前训练视角预览图和 Gaussian 参数 checkpoint。
             save_preview(preview_dir / f"step_{step:06d}.png", render.image)
             save_checkpoint(checkpoint_dir / f"step_{step:06d}.ply", model)
 
     elapsed = time.perf_counter() - started_at
     save_checkpoint(out_dir / "final.ply", model)
-    save_training_summary(out_dir / "training_summary.json", args, data_dir, out_dir, model.num_gaussians, elapsed)
+    save_training_summary(
+        out_dir / "training_summary.json",
+        args,
+        data_dir,
+        out_dir,
+        model.num_gaussians,
+        elapsed,
+        best_tracker.to_dict() if best_tracker is not None else None,
+    )
     print(f"训练完成：最终模型已保存到 {out_dir / 'final.ply'}，总耗时 {format_duration(elapsed)}")
 
 
@@ -330,6 +380,18 @@ def save_checkpoint(path: Path, model: GaussianModel) -> None:
     write_ply(str(path), data)
 
 
+def should_save_training_artifacts(step: int, iterations: int, save_every: int) -> bool:
+    """Return whether this step should write preview/checkpoint artifacts."""
+    return int(save_every) > 0 and (int(step) == 1 or int(step) % int(save_every) == 0 or int(step) == int(iterations))
+
+
+def save_best_metrics(path: Path, best_metrics: dict) -> None:
+    """Persist best metric records and evaluation history."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(best_metrics, handle, ensure_ascii=False, indent=2)
+
+
 def save_training_summary(
     path: Path,
     args: argparse.Namespace,
@@ -337,8 +399,11 @@ def save_training_summary(
     out_dir: Path,
     final_gaussians: int,
     elapsed_seconds: float,
+    best_metrics: dict | None = None,
 ) -> None:
     """Persist narrow run metadata consumed by benchmark aggregation."""
+    effective_reallocate_fraction = args.reallocate_fraction if uses_reallocation(args.densification_mode) else 0.0
+    best_fields = flatten_best_metric_fields(best_metrics)
     summary = {
         "data": str(data_dir),
         "out": str(out_dir),
@@ -351,6 +416,10 @@ def save_training_summary(
         "seed": int(args.seed),
         "densification_mode": args.densification_mode,
         "disable_densification": bool(args.disable_densification),
+        "eval_every": int(args.eval_every),
+        "eval_lpips": bool(args.eval_lpips and args.eval_every > 0),
+        "lpips_net": str(args.lpips_net) if args.eval_lpips and args.eval_every > 0 else "",
+        "lpips_backend": str(args.lpips_backend) if args.eval_lpips and args.eval_every > 0 else "",
         "densify_grad_threshold": float(args.densify_grad_threshold),
         "densify_start_step": int(args.densify_start_step),
         "densify_stop_step": int(args.densify_stop_step),
@@ -362,34 +431,30 @@ def save_training_summary(
         "patch_detail_lambda": float(args.patch_detail_lambda),
         "semantic_importance_root": (
             str(resolve_input_path(args.semantic_importance_root))
-            if args.semantic_importance_root and args.densification_mode == "patch_guided_semantic"
+            if args.semantic_importance_root and uses_semantic_importance(args.densification_mode)
             else ""
         ),
         "semantic_base": float(args.semantic_base),
-        "uses_semantic_importance": bool(args.densification_mode == "patch_guided_semantic"),
-        "reallocate_fraction": float(args.reallocate_fraction),
+        "uses_semantic_importance": bool(uses_semantic_importance(args.densification_mode)),
+        "reallocate_fraction": float(effective_reallocate_fraction),
         "clone_jitter_scale": float(args.clone_jitter_scale),
+        "best_metrics_json": str(out_dir / "best_metrics.json") if best_metrics else "",
         "final_gaussians": int(final_gaussians),
         "elapsed_seconds": float(elapsed_seconds),
     }
+    summary.update(best_fields)
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(summary, handle, ensure_ascii=False, indent=2)
 
 
-@torch.no_grad()
-def evaluate_psnr(model: GaussianModel, renderer: GaussianRenderer, cameras: list[Camera]) -> float:
-    """Render held-out cameras and return their mean PSNR."""
-    values = []
-    for camera in cameras:
-        gt_image = require_camera_image(camera)
-        render = renderer.render(model, camera)
-        values.append(
-            compute_psnr(
-                render.image.detach().clamp(0.0, 1.0).permute(1, 2, 0).cpu().numpy(),
-                gt_image.detach().permute(1, 2, 0).cpu().numpy(),
-            )
-        )
-    return float(np.mean(values)) if values else float("nan")
+def format_eval_metrics(metrics: dict[str, float | None]) -> str:
+    parts = []
+    for name, label, precision in [("psnr", "PSNR", 2), ("ssim", "SSIM", 4), ("l1", "L1", 5), ("lpips", "LPIPS", 4)]:
+        value = metrics.get(name)
+        if value is None:
+            continue
+        parts.append(f"{label}={value:.{precision}f}")
+    return " ".join(parts) if parts else "无有效指标"
 
 
 def format_duration(seconds: float) -> str:

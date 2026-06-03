@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import importlib
 import math
 import tempfile
 import unittest
@@ -10,6 +12,13 @@ import torch
 from PIL import Image
 
 from methods.semantic_importance import SemanticImportanceProvider
+from modules import (
+    BestMetricTracker,
+    flatten_best_metric_fields,
+    uses_reallocation,
+    uses_semantic_importance,
+    validate_semantic_importance_root,
+)
 from modules.densification import (
     DensificationConfig,
     DensificationController,
@@ -21,6 +30,9 @@ from modules.densification import (
 from modules.gaussian_model import GaussianModel, PARAMETER_NAMES
 from modules.optim import build_3dgs_optimizer
 from modules.renderer import RenderOutput
+
+benchmark_patch_densification = importlib.import_module("methods.3dgs.benchmark_patch_densification")
+train_3dgs_scene = importlib.import_module("methods.3dgs.train_3dgs_scene")
 
 
 class ThreeDGSPatchDensificationTest(unittest.TestCase):
@@ -207,6 +219,147 @@ class ThreeDGSPatchDensificationTest(unittest.TestCase):
 
             with self.assertRaises(FileNotFoundError):
                 provider.load("/any/path/missing.jpg", width=4, height=3)
+
+    def test_densification_mode_contracts_keep_semantic_and_reallocate_separate(self) -> None:
+        self.assertFalse(uses_semantic_importance("patch_reallocate"))
+        self.assertTrue(uses_reallocation("patch_reallocate"))
+        self.assertTrue(uses_semantic_importance("patch_reallocate_semantic"))
+        self.assertTrue(uses_reallocation("patch_reallocate_semantic"))
+
+        validate_semantic_importance_root(["patch_reallocate"], "")
+        with self.assertRaisesRegex(ValueError, "patch_reallocate_semantic"):
+            validate_semantic_importance_root(["patch_reallocate_semantic"], "")
+
+    def test_best_metric_tracker_tracks_maxima_and_lpips_minimum(self) -> None:
+        tracker = BestMetricTracker(include_lpips=True)
+
+        first = tracker.update(100, {"psnr": 20.0, "ssim": 0.70, "l1": 0.05, "lpips": 0.40})
+        self.assertEqual(set(first), {"psnr", "ssim", "lpips"})
+        tracker.set_checkpoint("psnr", "best/best_psnr.ply")
+        tracker.set_checkpoint("ssim", "best/best_ssim.ply")
+        tracker.set_checkpoint("lpips", "best/best_lpips.ply")
+
+        second = tracker.update(200, {"psnr": 19.0, "ssim": 0.75, "l1": 0.04, "lpips": 0.35})
+        self.assertEqual(set(second), {"ssim", "lpips"})
+        tracker.set_checkpoint("ssim", "best/best_ssim_step200.ply")
+        tracker.set_checkpoint("lpips", "best/best_lpips_step200.ply")
+
+        payload = tracker.to_dict()
+        fields = flatten_best_metric_fields(payload)
+        self.assertEqual(fields["best_psnr"], 20.0)
+        self.assertEqual(fields["best_psnr_step"], 100)
+        self.assertEqual(fields["best_psnr_checkpoint"], "best/best_psnr.ply")
+        self.assertEqual(fields["best_ssim_step"], 200)
+        self.assertEqual(fields["best_lpips"], 0.35)
+        self.assertEqual(len(payload["history"]), 2)
+
+    def test_semantic_base_values_expand_only_semantic_variants(self) -> None:
+        specs = benchmark_patch_densification.build_run_specs(
+            ["standard_3dgs", "patch_guided", "patch_guided_semantic"],
+            semantic_base=0.2,
+            semantic_base_values=[0.2, 0.4],
+        )
+
+        self.assertEqual(
+            [(spec.variant, spec.semantic_base, spec.semantic_base_label) for spec in specs],
+            [
+                ("standard_3dgs", 0.2, ""),
+                ("patch_guided", 0.2, ""),
+                ("patch_guided_semantic", 0.2, "base_0p20"),
+                ("patch_guided_semantic", 0.4, "base_0p40"),
+            ],
+        )
+
+    def test_csv_only_skip_existing_does_not_require_final_ply(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            final_ply = root / "train" / "final.ply"
+            metrics_csv = root / "test_renders" / "metrics.csv"
+            training_summary = root / "train" / "training_summary.json"
+            metrics_csv.parent.mkdir(parents=True)
+            training_summary.parent.mkdir(parents=True)
+            metrics_csv.write_text("image,psnr\nframe.png,20\n", encoding="utf-8")
+            training_summary.write_text("{}", encoding="utf-8")
+
+            self.assertTrue(benchmark_patch_densification.is_run_complete(True, final_ply, metrics_csv, training_summary))
+            self.assertFalse(benchmark_patch_densification.is_run_complete(False, final_ply, metrics_csv, training_summary))
+
+    def test_compact_summary_hides_path_and_checkpoint_fields_and_writes_aggregate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            out_dir = Path(tmp_dir)
+            rows = [
+                {
+                    "scene": "cur",
+                    "variant": "patch_guided_semantic",
+                    "semantic_base": 0.2,
+                    "seed": 1,
+                    "psnr": 20.0,
+                    "ssim": 0.8,
+                    "lpips": 0.2,
+                    "l1": 0.05,
+                    "gaussian_count": 100,
+                    "train_seconds": 10.0,
+                    "total_seconds": 12.0,
+                    "final_ply": "/tmp/final.ply",
+                    "best_psnr_checkpoint": "/tmp/best.ply",
+                },
+                {
+                    "scene": "cur",
+                    "variant": "patch_guided_semantic",
+                    "semantic_base": 0.2,
+                    "seed": 2,
+                    "psnr": 22.0,
+                    "ssim": 0.9,
+                    "lpips": 0.1,
+                    "l1": 0.03,
+                    "gaussian_count": 120,
+                    "train_seconds": 14.0,
+                    "total_seconds": 16.0,
+                },
+            ]
+
+            benchmark_patch_densification.write_summary(out_dir, rows, compact=True)
+
+            with (out_dir / "summary.csv").open(newline="", encoding="utf-8") as handle:
+                header = next(csv.reader(handle))
+            self.assertEqual(header, benchmark_patch_densification.COMPACT_SUMMARY_FIELDS)
+            self.assertNotIn("final_ply", header)
+            self.assertNotIn("best_psnr_checkpoint", header)
+
+            with (out_dir / "summary_agg.csv").open(newline="", encoding="utf-8") as handle:
+                aggregate_rows = list(csv.DictReader(handle))
+            self.assertEqual(len(aggregate_rows), 1)
+            self.assertEqual(aggregate_rows[0]["count"], "2")
+            self.assertAlmostEqual(float(aggregate_rows[0]["psnr_mean"]), 21.0)
+
+    def test_save_every_zero_disables_step_artifacts(self) -> None:
+        self.assertFalse(train_3dgs_scene.should_save_training_artifacts(step=1, iterations=100, save_every=0))
+        self.assertTrue(train_3dgs_scene.should_save_training_artifacts(step=1, iterations=100, save_every=100))
+        self.assertTrue(train_3dgs_scene.should_save_training_artifacts(step=100, iterations=100, save_every=100))
+
+    def test_cleanup_csv_only_artifacts_keeps_metric_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            run_dir = Path(tmp_dir)
+            keep_files = [
+                run_dir / "train" / "training_summary.json",
+                run_dir / "test_renders" / "metrics.csv",
+            ]
+            delete_files = [
+                run_dir / "train" / "final.ply",
+                run_dir / "train" / "checkpoints" / "step_000001.ply",
+                run_dir / "train" / "best" / "best_psnr.ply",
+                run_dir / "train" / "previews" / "step_000001.png",
+                run_dir / "test_renders" / "000_frame_render.png",
+                run_dir / "test_renders" / "000_frame_gt.png",
+            ]
+            for path in keep_files + delete_files:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("x", encoding="utf-8")
+
+            benchmark_patch_densification.cleanup_csv_only_artifacts(run_dir)
+
+            self.assertTrue(all(path.exists() for path in keep_files))
+            self.assertFalse(any(path.exists() for path in delete_files))
 
     def test_reallocation_keeps_budget_and_optimizer_lengths_consistent(self) -> None:
         model = make_model(8)

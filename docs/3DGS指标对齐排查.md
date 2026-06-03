@@ -289,13 +289,14 @@ cd /root/SJTU
 python methods/3dgs/benchmark_patch_densification.py \
   --data-root outputs/aligned_datasets/SeathruNeRF_undistorted \
   --scenes Curasao IUI3-RedSea JapaneseGradens-RedSea Panama \
-  --variants standard_3dgs patch_guided patch_guided_semantic patch_reallocate \
+  --variants standard_3dgs patch_guided patch_guided_semantic patch_reallocate patch_reallocate_semantic \
   --seeds 0 1 \
   --iterations 19999 \
   --factor 1 \
   --target-width 720 \
   --holdout 8 \
   --holdout-offset 0 \
+  --train-eval-every 1000 \
   --lpips \
   --lpips-net vgg \
   --lpips-backend official_3dgs \
@@ -324,6 +325,7 @@ python methods/3dgs/benchmark_patch_densification.py \
   --target-width 720 \
   --holdout 8 \
   --holdout-offset 0 \
+  --train-eval-every 1000 \
   --lpips \
   --lpips-net vgg \
   --lpips-backend official_3dgs \
