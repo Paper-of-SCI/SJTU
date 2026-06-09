@@ -53,6 +53,7 @@ class GaussianRenderer:
         camera: Camera,
         sh_degree: Optional[int] = None,
         render_mode: RenderMode = "RGB",
+        override_colors: Optional[Tensor] = None,
     ) -> RenderOutput:
         """Render one camera from one GaussianModel."""
         try:
@@ -62,13 +63,20 @@ class GaussianRenderer:
 
         tensors = model.activated_tensors()
         degree = model.sh_degree if sh_degree is None else min(int(sh_degree), model.sh_degree)
+        raster_colors = tensors.colors
+        raster_sh_degree = degree
+        if override_colors is not None:
+            if override_colors.ndim != 2 or override_colors.shape[0] != model.num_gaussians:
+                raise ValueError("override_colors must have shape [num_gaussians, channels]")
+            raster_colors = override_colors.to(device=tensors.means.device, dtype=tensors.means.dtype)
+            raster_sh_degree = None
         background = _background_tensor(self.background, camera.device)
         colors, alphas, meta = rasterization(
             means=tensors.means,
             quats=tensors.quats,
             scales=tensors.scales,
             opacities=tensors.opacities,
-            colors=tensors.colors,
+            colors=raster_colors,
             viewmats=camera.viewmat[None, ...],
             Ks=camera.K[None, ...],
             width=camera.width,
@@ -77,7 +85,7 @@ class GaussianRenderer:
             far_plane=camera.far,
             radius_clip=self.radius_clip,
             eps2d=self.eps2d,
-            sh_degree=degree,
+            sh_degree=raster_sh_degree,
             packed=self.packed,
             backgrounds=None,
             render_mode=render_mode,
