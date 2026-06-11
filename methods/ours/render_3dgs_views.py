@@ -1,0 +1,228 @@
+"""Render a trained 3DGS PLY checkpoint on dataset camera views."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import sys
+from pathlib import Path
+
+import torch
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from modules import (
+    Camera,
+    GaussianModel,
+    GaussianRenderer,
+    MediumField,
+    MediumRenderConfig,
+    MediumRenderer,
+    build_lpips_evaluator,
+    compute_image_metrics,
+    medium_checkpoint_path_for_ply,
+    resize_to_gt_if_needed,
+)
+from utils.dataset_loaders import load_colmap_dataset
+from utils.image_utils import save_image
+from utils.ply_io import ply_dict_to_gaussians, read_ply
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Render a 3DGS PLY checkpoint on dataset camera views.")
+    parser.add_argument("--data", default="src/datasets/SeathruNeRF_dataset/Curasao", help="COLMAP scene directory.")
+    parser.add_argument("--checkpoint", default="outputs/3dgs_scene/final.ply", help="3DGS Gaussian PLY checkpoint.")
+    parser.add_argument("--out", default="outputs/3dgs_scene/renders", help="Output render directory.")
+    parser.add_argument("--split", default="test", choices=["train", "test", "val"], help="Camera split to render.")
+    parser.add_argument("--factor", type=int, default=-1, help="Image downscale factor; -1 keeps images at original size unless width exceeds 1600.")
+    parser.add_argument("--target-height", type=int, default=0, help="Resize images to this height while preserving aspect ratio; 0 uses --factor.")
+    parser.add_argument("--target-width", type=int, default=0, help="Resize images to this width while preserving aspect ratio; 0 uses --target-height or --factor.")
+    parser.add_argument("--holdout", type=int, default=8, help="Holdout interval.")
+    parser.add_argument("--holdout-offset", type=int, default=0, help="Offset used when selecting every Nth held-out image.")
+    parser.add_argument("--max-images", type=int, default=0, help="Limit rendered image count; 0 means all.")
+    parser.add_argument("--lpips", action="store_true", help="Also compute LPIPS if the lpips package is installed.")
+    parser.add_argument("--lpips-net", default="vgg", choices=["alex", "vgg", "squeeze"], help="LPIPS backbone used when --lpips is enabled.")
+    parser.add_argument(
+        "--lpips-backend",
+        default="lpips",
+        choices=["lpips", "official_3dgs"],
+        help="LPIPS implementation. official_3dgs matches graphdeco gaussian-splatting metrics.py.",
+    )
+    parser.add_argument("--disable-medium", action="store_true", help="Render the plain 3DGS checkpoint without a medium sidecar.")
+    parser.add_argument("--medium-checkpoint", default="", help="Medium field checkpoint; empty auto-detects next to the PLY checkpoint.")
+    parser.add_argument("--medium-far", type=float, default=0.0, help="Fallback medium integration distance; 0 uses scene_extent*4.")
+    parser.add_argument("--medium-chunk-pixels", type=int, default=65536, help="Pixel chunk size for medium ray integration.")
+    parser.add_argument("--medium-alpha-threshold", type=float, default=1.0e-3, help="Alpha threshold for choosing rendered depth over fallback medium far.")
+    parser.add_argument("--no-save-images", action="store_true", help="Only write metrics.csv; do not save render/GT PNG images.")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    if not torch.cuda.is_available():
+        raise RuntimeError("渲染脚本需要 CUDA。")
+
+    data_dir = resolve_input_path(args.data)
+    checkpoint = resolve_input_path(args.checkpoint)
+    out_dir = resolve_output_path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    device = torch.device("cuda")
+    scene = load_colmap_dataset(
+        str(data_dir),
+        split=args.split,
+        load_images=False,
+        factor=args.factor,
+        target_height=args.target_height,
+        target_width=args.target_width,
+        holdout=args.holdout,
+        holdout_offset=args.holdout_offset,
+        opengl=False,
+    )
+    model = load_gaussian_checkpoint(checkpoint, device)
+    base_renderer = GaussianRenderer(background=(1.0, 1.0, 1.0))
+    medium_field, medium_path = load_medium_for_render(args, checkpoint, device)
+    renderer = build_active_renderer(args, base_renderer, medium_field, scene)
+    lpips_evaluator = build_lpips_evaluator(device, args.lpips_net, args.lpips_backend) if args.lpips else None
+
+    count = len(scene.image_paths) if args.max_images <= 0 else min(args.max_images, len(scene.image_paths))
+    metric_rows = []
+    print(f"设备：CUDA GPU='{torch.cuda.get_device_name(device)}'")
+    print(f"checkpoint={checkpoint}")
+    print(f"medium_checkpoint={medium_path if medium_field is not None else 'disabled'}")
+    print(
+        f"split={args.split} images={count}/{len(scene.image_paths)} "
+        f"resolution={scene.width}x{scene.height} target_height={args.target_height} target_width={args.target_width} factor={args.factor} "
+        f"holdout={args.holdout} holdout_offset={args.holdout_offset} "
+        f"lpips_backend={args.lpips_backend if args.lpips else ''}"
+    )
+    print(f"输出目录：{out_dir}")
+
+    for index in range(count):
+        camera = Camera.from_scene_data(scene, index, device=device, load_image=True)
+        with torch.no_grad():
+            render = renderer.render(model, camera)
+        image = render.image.detach().clamp(0.0, 1.0)
+        gt = camera.image.detach()
+        image = resize_to_gt_if_needed(image, gt)
+        metrics = compute_image_metrics(image, gt, lpips_evaluator)
+        metric_rows.append(
+            {
+                "image": Path(camera.image_path).name,
+                "psnr": metrics["psnr"],
+                "ssim": metrics["ssim"],
+                "l1": metrics["l1"],
+                "lpips": metrics["lpips"],
+            }
+        )
+
+        if not args.no_save_images:
+            stem = Path(camera.image_path).stem
+            save_image(str(out_dir / f"{index:03d}_{stem}_render.png"), image.permute(1, 2, 0).cpu().numpy())
+            save_image(str(out_dir / f"{index:03d}_{stem}_gt.png"), gt.permute(1, 2, 0).cpu().numpy())
+        lpips_text = f" LPIPS={metrics['lpips']:.4f}" if metrics["lpips"] is not None else ""
+        print(
+            f"[{index + 1}/{count}] {Path(camera.image_path).name} "
+            f"PSNR={metrics['psnr']:.2f} SSIM={metrics['ssim']:.4f} L1={metrics['l1']:.5f}{lpips_text}"
+        )
+
+    if metric_rows:
+        save_metrics_csv(out_dir / "metrics.csv", metric_rows, include_lpips=lpips_evaluator is not None)
+        avg_psnr = mean_metric(metric_rows, "psnr")
+        avg_ssim = mean_metric(metric_rows, "ssim")
+        avg_l1 = mean_metric(metric_rows, "l1")
+        avg_lpips = mean_metric(metric_rows, "lpips") if lpips_evaluator is not None else None
+        lpips_text = f" 平均 LPIPS={avg_lpips:.4f}" if avg_lpips is not None else ""
+        print(f"平均 PSNR={avg_psnr:.2f} 平均 SSIM={avg_ssim:.4f} 平均 L1={avg_l1:.5f}{lpips_text}")
+        print(f"指标 CSV：{out_dir / 'metrics.csv'}")
+    print("渲染完成。")
+
+
+def load_gaussian_checkpoint(path: Path, device: torch.device) -> GaussianModel:
+    means, log_scales, quats, logit_opacities, features_dc, features_rest = ply_dict_to_gaussians(read_ply(str(path)))
+    sh_bases = 1 + features_rest.shape[1]
+    sh_degree = int(round(sh_bases**0.5 - 1))
+    model = GaussianModel(sh_degree=sh_degree).to(device)
+    model.replace_tensors(
+        {
+            "means": torch.as_tensor(means, dtype=torch.float32, device=device),
+            "log_scales": torch.as_tensor(log_scales, dtype=torch.float32, device=device),
+            "quats": torch.as_tensor(quats, dtype=torch.float32, device=device),
+            "logit_opacities": torch.as_tensor(logit_opacities, dtype=torch.float32, device=device),
+            "features_dc": torch.as_tensor(features_dc, dtype=torch.float32, device=device),
+            "features_rest": torch.as_tensor(features_rest, dtype=torch.float32, device=device),
+        }
+    )
+    return model
+
+
+def load_medium_for_render(args: argparse.Namespace, checkpoint: Path, device: torch.device) -> tuple[MediumField | None, Path | None]:
+    if bool(args.disable_medium):
+        return None, None
+    if args.medium_checkpoint:
+        medium_path = resolve_input_path(args.medium_checkpoint)
+        if not medium_path.exists():
+            raise FileNotFoundError(f"找不到 medium checkpoint: {medium_path}")
+    else:
+        medium_path = medium_checkpoint_path_for_ply(checkpoint)
+        if not medium_path.exists():
+            print(f"未找到 medium checkpoint，按普通 3DGS 渲染: {medium_path}")
+            return None, None
+    payload = torch.load(medium_path, map_location=device)
+    return MediumField.from_checkpoint_payload(payload, device), medium_path
+
+
+def build_active_renderer(args: argparse.Namespace, renderer: GaussianRenderer, medium_field: MediumField | None, scene):
+    if medium_field is None:
+        return renderer
+    far_distance = float(args.medium_far) if float(args.medium_far) > 0.0 else float(scene.scene_extent) * 4.0
+    return MediumRenderer(
+        renderer,
+        medium_field,
+        MediumRenderConfig(
+            far_distance=max(far_distance, 1.0e-3),
+            chunk_pixels=max(int(args.medium_chunk_pixels), 1),
+            alpha_threshold=max(float(args.medium_alpha_threshold), 0.0),
+        ),
+    )
+
+
+def save_metrics_csv(path: Path, rows: list[dict], include_lpips: bool) -> None:
+    fieldnames = ["image", "psnr", "ssim", "l1"]
+    if include_lpips:
+        fieldnames.append("lpips")
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({name: row[name] for name in fieldnames})
+
+
+def mean_metric(rows: list[dict], name: str) -> float | None:
+    values = [row[name] for row in rows if row[name] is not None]
+    if not values:
+        return None
+    return float(sum(values) / len(values))
+
+
+def resolve_input_path(path: str) -> Path:
+    candidate = Path(path).expanduser()
+    if candidate.exists():
+        return candidate
+    root_candidate = ROOT / candidate
+    if root_candidate.exists():
+        return root_candidate
+    raise FileNotFoundError(f"找不到路径: {path}；也尝试过 {root_candidate}")
+
+
+def resolve_output_path(path: str) -> Path:
+    candidate = Path(path).expanduser()
+    if candidate.is_absolute():
+        return candidate
+    return ROOT / candidate
+
+
+if __name__ == "__main__":
+    main()

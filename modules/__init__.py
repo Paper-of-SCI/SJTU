@@ -26,7 +26,9 @@ from modules.evaluation import (
     resize_to_gt_if_needed,
 )
 from modules.gaussian_model import GaussianModel
-from modules.losses import l1_loss, photometric_loss, ssim
+from modules.losses import image_gradient_magnitude, l1_loss, medium_decorrelation_loss, photometric_loss, ssim, underwater_loss
+from modules.medium_field import MediumField, MediumFieldConfig, medium_checkpoint_path_for_ply, scene_medium_config
+from modules.medium_renderer import MediumRenderConfig, MediumRenderOutput, MediumRenderer
 from modules.optim import OptimConfig, build_3dgs_optimizer, exponential_lr, set_group_lr
 from modules.renderer import GaussianRenderer, RenderOutput
 
@@ -38,6 +40,11 @@ __all__ = [
     "DENSIFICATION_MODE_CHOICES",
     "GaussianModel",
     "GaussianRenderer",
+    "MediumField",
+    "MediumFieldConfig",
+    "MediumRenderConfig",
+    "MediumRenderOutput",
+    "MediumRenderer",
     "OptimConfig",
     "PatchGuidedDensificationConfig",
     "PatchGuidedDensificationController",
@@ -49,13 +56,18 @@ __all__ = [
     "evaluate_cameras",
     "exponential_lr",
     "flatten_best_metric_fields",
+    "image_gradient_magnitude",
     "l1_loss",
+    "medium_checkpoint_path_for_ply",
+    "medium_decorrelation_loss",
     "mean_metrics",
     "normalize_densification_mode",
     "photometric_loss",
     "resize_to_gt_if_needed",
     "set_group_lr",
     "ssim",
+    "scene_medium_config",
+    "underwater_loss",
     "uses_patch_densifier",
     "uses_reallocation",
     "uses_semantic_importance",
