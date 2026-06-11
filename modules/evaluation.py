@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Callable, Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -17,7 +17,7 @@ from modules.losses import ssim
 from modules.renderer import GaussianRenderer
 from utils.image_utils import compute_psnr
 
-MetricDict = dict[str, Optional[float]]
+MetricDict = Dict[str, Optional[float]]
 LPIPSEvaluatorFn = Callable[[torch.Tensor, torch.Tensor], float]
 
 

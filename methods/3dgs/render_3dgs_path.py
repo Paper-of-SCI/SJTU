@@ -26,7 +26,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out", default="outputs/3dgs_scene/path_interpolate", help="Output frame directory.")
     parser.add_argument("--mode", default="interpolate", choices=["interpolate", "orbit"], help="Novel-view path type.")
     parser.add_argument("--split", default="train", choices=["train", "test", "val"], help="Reference camera split.")
-    parser.add_argument("--factor", type=int, default=4, help="Image downscale factor.")
+    parser.add_argument("--factor", type=int, default=-1, help="Image downscale factor; -1 keeps images at original size unless width exceeds 1600.")
     parser.add_argument("--holdout", type=int, default=8, help="Holdout interval.")
     parser.add_argument("--frames", type=int, default=60, help="Number of frames to render.")
     parser.add_argument("--start", type=int, default=0, help="Start camera index for interpolate mode.")

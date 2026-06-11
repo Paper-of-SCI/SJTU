@@ -12,6 +12,8 @@ from utils.camera_utils import colmap_image_to_c2w, estimate_scene_extent
 from utils.colmap_reader import read_colmap_model
 from utils.image_utils import load_image
 
+AUTO_RESOLUTION_MAX_WIDTH = 1600
+
 
 @dataclass(frozen=True)
 class SceneData:
@@ -166,6 +168,11 @@ def _scaled_resolution(width: int, height: int, factor: int, target_height: int 
     if target_width > 0:
         scale = float(target_width) / float(width)
         return max(int(target_width), 1), max(int(round(height * scale)), 1), scale
+    if int(factor) == -1:
+        if width > AUTO_RESOLUTION_MAX_WIDTH:
+            scale = float(AUTO_RESOLUTION_MAX_WIDTH) / float(width)
+            return AUTO_RESOLUTION_MAX_WIDTH, max(int(round(height * scale)), 1), scale
+        return int(width), int(height), 1.0
     safe_factor = max(int(factor), 1)
     scale = 1.0 / float(safe_factor)
     return max(int(width // safe_factor), 1), max(int(height // safe_factor), 1), scale

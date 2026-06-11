@@ -166,9 +166,14 @@ def prepare_colmap_scene(
         holdout_offset=int(holdout_offset),
     )
     manifest_path = prepared_dir / "watersplatting_prepared_manifest.json"
+    train_names = [image_paths[index].name for index in train_indices]
+    test_names = [image_paths[index].name for index in test_indices]
     if manifest_path.exists() and not overwrite:
         existing = json.loads(manifest_path.read_text(encoding="utf-8"))
         if _manifest_matches(existing, info):
+            write_split_file(prepared_dir / "train_list.txt", train_names)
+            write_split_file(prepared_dir / "test_list.txt", test_names)
+            write_split_file(prepared_dir / "val_list.txt", test_names)
             return info
         raise ValueError(f"prepared data 已存在但配置不同: {prepared_dir}；需要重建请加 --overwrite-prepared-data")
 
@@ -186,8 +191,9 @@ def prepare_colmap_scene(
         shutil.rmtree(prepared_sparse_dir)
     shutil.copytree(sparse_dir, prepared_sparse_dir)
     scale_colmap_cameras(prepared_sparse_dir, width, height, scale_x, scale_y)
-    write_split_file(prepared_dir / "train_list.txt", [image_paths[index].name for index in train_indices])
-    write_split_file(prepared_dir / "test_list.txt", [image_paths[index].name for index in test_indices])
+    write_split_file(prepared_dir / "train_list.txt", train_names)
+    write_split_file(prepared_dir / "test_list.txt", test_names)
+    write_split_file(prepared_dir / "val_list.txt", test_names)
     manifest_path.write_text(json.dumps(info.to_dict(), indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     return info
 

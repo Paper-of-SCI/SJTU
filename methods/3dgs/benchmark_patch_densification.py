@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seeds", nargs="+", type=int, default=[0], help="Random seeds.")
     parser.add_argument("--iterations", type=int, default=7000, help="Training iterations per run.")
-    parser.add_argument("--factor", type=int, default=4, help="Image downscale factor.")
+    parser.add_argument("--factor", type=int, default=-1, help="Image downscale factor; -1 keeps images at original size unless width exceeds 1600.")
     parser.add_argument("--target-height", type=int, default=0, help="Resize images to this height while preserving aspect ratio; 0 uses --factor.")
     parser.add_argument("--target-width", type=int, default=0, help="Resize images to this width while preserving aspect ratio; 0 uses --target-height or --factor.")
     parser.add_argument("--holdout", type=int, default=8, help="Holdout interval.")

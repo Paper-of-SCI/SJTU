@@ -32,7 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", default="outputs/3dgs_scene/final.ply", help="3DGS Gaussian PLY checkpoint.")
     parser.add_argument("--out", default="outputs/3dgs_scene/renders", help="Output render directory.")
     parser.add_argument("--split", default="test", choices=["train", "test", "val"], help="Camera split to render.")
-    parser.add_argument("--factor", type=int, default=4, help="Image downscale factor.")
+    parser.add_argument("--factor", type=int, default=-1, help="Image downscale factor; -1 keeps images at original size unless width exceeds 1600.")
     parser.add_argument("--target-height", type=int, default=0, help="Resize images to this height while preserving aspect ratio; 0 uses --factor.")
     parser.add_argument("--target-width", type=int, default=0, help="Resize images to this width while preserving aspect ratio; 0 uses --target-height or --factor.")
     parser.add_argument("--holdout", type=int, default=8, help="Holdout interval.")
