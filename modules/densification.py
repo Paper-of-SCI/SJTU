@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from modules.gaussian_model import GaussianModel, PARAMETER_NAMES, quats_to_rotmats
+from modules.perceptual_detail import VGG16PerceptualPatchScorer
 from modules.renderer import RenderOutput
 
 
@@ -58,6 +59,8 @@ class PatchGuidedDensificationConfig:
     patch_size: int = 16
     edge_weight: float = 0.75
     detail_lambda: float = 2.0
+    perceptual_weight: float = 0.0
+    perceptual_max_size: int = 768
     semantic_base: float = 0.2
     reallocate_fraction: float = 0.0
     clone_jitter_scale: float = 0.05
@@ -168,6 +171,7 @@ class PatchGuidedDensificationController:
         self.config = config or PatchGuidedDensificationConfig()
         self._detail_accum: Optional[Tensor] = None
         self._detail_count: Optional[Tensor] = None
+        self._perceptual_scorer: Optional[VGG16PerceptualPatchScorer] = None
 
     def update(
         self,
@@ -190,11 +194,14 @@ class PatchGuidedDensificationController:
             )
             with torch.no_grad():
                 self._ensure_buffers(model)
+                perceptual_detail = self._compute_perceptual_detail(render_output.image.detach(), gt_image.detach())
                 detail_map = _compute_patch_detail(
                     render_output.image.detach(),
                     gt_image.detach(),
                     patch_size=self.config.patch_size,
                     edge_weight=self.config.edge_weight,
+                    perceptual_detail=perceptual_detail,
+                    perceptual_weight=self.config.perceptual_weight,
                     semantic_importance=semantic_importance.detach() if semantic_importance is not None else None,
                     semantic_base=self.config.semantic_base,
                     eps=self.config.eps,
@@ -241,6 +248,24 @@ class PatchGuidedDensificationController:
         self._ensure_buffers(model)
         assert self._detail_accum is not None and self._detail_count is not None
         return self._detail_accum / self._detail_count.clamp_min(1.0)
+
+    def _compute_perceptual_detail(self, render_image: Tensor, gt_image: Tensor) -> Optional[Tensor]:
+        if self.config.perceptual_weight <= 0.0:
+            return None
+        scorer = self._get_perceptual_scorer(render_image.device)
+        return scorer.score(
+            render_image,
+            gt_image,
+            patch_size=self.config.patch_size,
+            max_size=self.config.perceptual_max_size,
+        )
+
+    def _get_perceptual_scorer(self, device: torch.device) -> VGG16PerceptualPatchScorer:
+        if self._perceptual_scorer is None:
+            self._perceptual_scorer = VGG16PerceptualPatchScorer(eps=self.config.eps).to(device)
+        else:
+            self._perceptual_scorer.to(device)
+        return self._perceptual_scorer
 
     def _densify(self, model: GaussianModel, optimizer: torch.optim.Optimizer, render_output: RenderOutput) -> DensificationStats:
         base = self.config.densification
@@ -339,6 +364,8 @@ def _compute_patch_detail(
     gt_image: Tensor,
     patch_size: int,
     edge_weight: float,
+    perceptual_detail: Optional[Tensor] = None,
+    perceptual_weight: float = 0.0,
     semantic_importance: Optional[Tensor] = None,
     semantic_base: float = 0.2,
     eps: float = 1.0e-6,
@@ -357,6 +384,17 @@ def _compute_patch_detail(
     patch_error = _normalize_minmax(patch_error, eps)
     patch_edge = _normalize_minmax(patch_edge, eps)
     detail = patch_error * (1.0 + float(edge_weight) * patch_edge)
+
+    if perceptual_detail is not None and perceptual_weight > 0.0:
+        perceptual = _validate_perceptual_detail(
+            perceptual_detail,
+            patch_height=int(detail.shape[-2]),
+            patch_width=int(detail.shape[-1]),
+            device=gt.device,
+            dtype=gt.dtype,
+        )
+        detail = detail + float(perceptual_weight) * perceptual
+
     detail = _normalize_minmax(detail, eps)
 
     if semantic_importance is not None:
@@ -375,6 +413,20 @@ def _validate_semantic_importance(semantic_importance: Tensor, height: int, widt
     if int(semantic_importance.shape[-2]) != int(height) or int(semantic_importance.shape[-1]) != int(width):
         raise ValueError("semantic_importance must have HW shape matching gt_image")
     return semantic_importance.detach().clamp(0.0, 1.0)
+
+
+def _validate_perceptual_detail(
+    perceptual_detail: Tensor,
+    patch_height: int,
+    patch_width: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tensor:
+    if perceptual_detail.ndim != 2:
+        raise ValueError("perceptual_detail must be a patch-grid HW tensor")
+    if int(perceptual_detail.shape[-2]) != int(patch_height) or int(perceptual_detail.shape[-1]) != int(patch_width):
+        raise ValueError("perceptual_detail must match the patch grid shape")
+    return perceptual_detail.detach().to(device=device, dtype=dtype).clamp(0.0, 1.0).unsqueeze(0).unsqueeze(0)
 
 
 def _patch_pool(image_bchw: Tensor, patch_size: int) -> Tensor:

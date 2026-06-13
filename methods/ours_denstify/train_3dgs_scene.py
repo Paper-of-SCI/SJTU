@@ -44,7 +44,12 @@ from modules import (
     uses_semantic_importance,
     validate_semantic_importance_root,
 )
-from methods.ours_denstify.lpips_backend import LPIPS_BACKEND_CHOICES, build_ours_lpips_evaluator
+from methods.ours_denstify.lpips_backend import (
+    LPIPS_BACKEND_CHOICES,
+    TRAIN_LPIPS_BACKEND_CHOICES,
+    build_ours_lpips_evaluator,
+    build_ours_train_lpips_loss,
+)
 from methods.semantic_importance import SemanticImportanceProvider
 from utils.dataset_loaders import load_colmap_dataset
 from utils.image_utils import compute_psnr, save_image
@@ -86,6 +91,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patch-size", type=int, default=16, help="Patch size for patch-guided densification.")
     parser.add_argument("--patch-edge-weight", type=float, default=0.75, help="Edge multiplier for patch detail scoring.")
     parser.add_argument("--patch-detail-lambda", type=float, default=2.0, help="Patch detail multiplier on screen-space gradients.")
+    parser.add_argument("--patch-perceptual-weight", type=float, default=0.0, help="VGG residual weight added to patch detail scoring; 0 disables it.")
+    parser.add_argument("--patch-perceptual-max-size", type=int, default=768, help="Longest side used for VGG residual patch scoring.")
+    parser.add_argument("--train-lpips-weight", type=float, default=0.0, help="Differentiable LPIPS loss weight used during training; 0 disables it.")
+    parser.add_argument("--train-lpips-start-step", type=int, default=7000, help="First training step that may include LPIPS loss.")
+    parser.add_argument("--train-lpips-max-size", type=int, default=512, help="Longest side used for differentiable training LPIPS loss; 0 keeps full resolution.")
+    parser.add_argument("--train-lpips-net", default="vgg", choices=["alex", "vgg", "squeeze"], help="LPIPS backbone used by training LPIPS loss.")
+    parser.add_argument(
+        "--train-lpips-backend",
+        default="seasplat",
+        choices=list(TRAIN_LPIPS_BACKEND_CHOICES),
+        help="LPIPS implementation used by training loss. The first supported backend is seasplat.",
+    )
     parser.add_argument("--semantic-importance-root", default="", help="Root directory for per-image semantic importance masks.")
     parser.add_argument("--semantic-base", type=float, default=0.2, help="Minimum semantic multiplier for semantic patch-guided densification.")
     parser.add_argument("--reallocate-fraction", type=float, default=0.10, help="Low-detail Gaussian fraction to reallocate in patch_reallocate modes.")
@@ -199,6 +216,8 @@ def main() -> None:
                 patch_size=args.patch_size,
                 edge_weight=args.patch_edge_weight,
                 detail_lambda=args.patch_detail_lambda,
+                perceptual_weight=args.patch_perceptual_weight,
+                perceptual_max_size=args.patch_perceptual_max_size,
                 semantic_base=args.semantic_base,
                 reallocate_fraction=effective_reallocate_fraction,
                 clone_jitter_scale=args.clone_jitter_scale,
@@ -212,6 +231,12 @@ def main() -> None:
     test_cameras = build_cameras(test_scene, device)
     eval_lpips_enabled = bool(args.eval_lpips and args.eval_every > 0)
     lpips_evaluator = build_ours_lpips_evaluator(device, args.lpips_net, args.lpips_backend) if eval_lpips_enabled else None
+    train_lpips_enabled = bool(args.train_lpips_weight > 0.0)
+    train_lpips_loss = (
+        build_ours_train_lpips_loss(device, args.train_lpips_net, args.train_lpips_backend, args.train_lpips_max_size)
+        if train_lpips_enabled
+        else None
+    )
     best_tracker = BestMetricTracker(include_lpips=eval_lpips_enabled) if args.eval_every > 0 else None
     best_metrics_path = out_dir / "best_metrics.json"
     if best_tracker is not None:
@@ -238,6 +263,7 @@ def main() -> None:
     print(
         f"densification_mode={args.densification_mode} patch_size={args.patch_size} "
         f"edge_weight={args.patch_edge_weight:g} detail_lambda={args.patch_detail_lambda:g} "
+        f"perceptual_weight={args.patch_perceptual_weight:g} perceptual_max_size={args.patch_perceptual_max_size} "
         f"semantic_base={args.semantic_base:g} reallocate_fraction={effective_reallocate_fraction:g}"
     )
     if semantic_enabled:
@@ -245,6 +271,11 @@ def main() -> None:
     print(
         f"heldout_eval_every={args.eval_every} eval_lpips={eval_lpips_enabled} "
         f"lpips_backend={args.lpips_backend if eval_lpips_enabled else ''}"
+    )
+    print(
+        f"train_lpips_weight={args.train_lpips_weight:g} train_lpips_start_step={args.train_lpips_start_step} "
+        f"train_lpips_max_size={args.train_lpips_max_size} "
+        f"train_lpips_backend={args.train_lpips_backend if train_lpips_enabled else ''}"
     )
     print(f"输出目录：{out_dir}")
 
@@ -267,7 +298,14 @@ def main() -> None:
         render = renderer.render(model, camera)
 
         # 图像监督：渲染图和 GT 图计算 L1 + DSSIM。
-        loss, parts = photometric_loss(render.image.clamp(0.0, 1.0), gt_image, lambda_dssim=args.lambda_dssim)
+        supervised_image = render.image.clamp(0.0, 1.0)
+        loss, parts = photometric_loss(supervised_image, gt_image, lambda_dssim=args.lambda_dssim)
+        train_lpips_value = None
+        if train_lpips_loss is not None and step >= max(int(args.train_lpips_start_step), 1):
+            train_lpips_value = train_lpips_loss(supervised_image, gt_image)
+            loss = loss + float(args.train_lpips_weight) * train_lpips_value
+            parts["train_lpips"] = train_lpips_value
+            parts["total"] = loss
 
         # 反向传播会把图像误差传回 Gaussian 参数，然后 Adam 更新这些参数。
         loss.backward()
@@ -311,6 +349,7 @@ def main() -> None:
             tqdm.write(
                 f"第 {step:06d} 步 | loss={float(loss.detach()):.6f} | "
                 f"L1={float(parts['l1'].detach()):.6f} | SSIM={float(parts['ssim'].detach()):.4f} | "
+                f"trainLPIPS={format_optional_tensor(train_lpips_value)} | "
                 f"训练PSNR={psnr:.2f} | Gaussian={model.num_gaussians}{densify_text}"
             )
 
@@ -429,6 +468,13 @@ def save_training_summary(
         "patch_size": int(args.patch_size),
         "patch_edge_weight": float(args.patch_edge_weight),
         "patch_detail_lambda": float(args.patch_detail_lambda),
+        "patch_perceptual_weight": float(args.patch_perceptual_weight),
+        "patch_perceptual_max_size": int(args.patch_perceptual_max_size),
+        "train_lpips_weight": float(args.train_lpips_weight),
+        "train_lpips_start_step": int(args.train_lpips_start_step),
+        "train_lpips_max_size": int(args.train_lpips_max_size),
+        "train_lpips_net": str(args.train_lpips_net) if args.train_lpips_weight > 0.0 else "",
+        "train_lpips_backend": str(args.train_lpips_backend) if args.train_lpips_weight > 0.0 else "",
         "semantic_importance_root": (
             str(resolve_input_path(args.semantic_importance_root))
             if args.semantic_importance_root and uses_semantic_importance(args.densification_mode)
@@ -455,6 +501,12 @@ def format_eval_metrics(metrics: dict[str, float | None]) -> str:
             continue
         parts.append(f"{label}={value:.{precision}f}")
     return " ".join(parts) if parts else "无有效指标"
+
+
+def format_optional_tensor(value: Tensor | None) -> str:
+    if value is None:
+        return "-"
+    return f"{float(value.detach()):.4f}"
 
 
 def format_duration(seconds: float) -> str:
