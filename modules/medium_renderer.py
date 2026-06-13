@@ -22,6 +22,8 @@ class MediumRenderConfig:
     far_distance: float
     chunk_pixels: int = 65536
     alpha_threshold: float = 1.0e-3
+    max_density: float = 10.0
+    max_optical_depth: float = 80.0
     eps: float = 1.0e-6
 
 
@@ -69,13 +71,14 @@ class MediumRenderer:
 
         medium_rgb_hwc = self.medium_field.medium_rgb.to(rgb_clear).view(1, 1, 3).expand(camera.height, camera.width, 3)
         d_hwc = d_ref.permute(1, 2, 0)
-        trans_attn = torch.exp(-medium_attn * d_hwc)
-        trans_bs = torch.exp(-medium_bs * d_hwc)
+        max_optical_depth = max(float(self.config.max_optical_depth), float(self.config.eps))
+        trans_attn = torch.exp(torch.clamp(-medium_attn * d_hwc, min=-max_optical_depth, max=0.0))
+        trans_bs = torch.exp(torch.clamp(-medium_bs * d_hwc, min=-max_optical_depth, max=0.0))
 
         rgb_clear_hwc = rgb_clear.permute(1, 2, 0)
         rgb_object_hwc = rgb_clear_hwc * trans_attn
         rgb_medium_hwc = medium_rgb_hwc * (1.0 - trans_bs)
-        pred_hwc = rgb_object_hwc + rgb_medium_hwc
+        pred_hwc = _finite_clamp(rgb_object_hwc + rgb_medium_hwc, 0.0, 1.0)
 
         metadata = dict(base.metadata)
         metadata.update(
@@ -124,6 +127,9 @@ class MediumRenderer:
             beta, sigma_b = self.medium_field(points.reshape(-1, 3))
             beta = beta.reshape(end - start, steps, 3)
             sigma_b = sigma_b.reshape(end - start, steps, 3)
+            max_density = max(float(self.config.max_density), 0.0)
+            beta = _finite_clamp(beta, 0.0, max_density)
+            sigma_b = _finite_clamp(sigma_b, 0.0, max_density)
 
             attn_chunks.append(beta.mean(dim=1))
             bs_chunks.append(sigma_b.mean(dim=1))
@@ -144,7 +150,7 @@ class MediumRenderer:
 
 def _remove_background(image: Tensor, alpha: Tensor, background, device: torch.device) -> Tensor:
     bg = _background_tensor(background, device=device, dtype=image.dtype).view(3, 1, 1)
-    return (image - bg * (1.0 - alpha)).clamp_min(0.0)
+    return _finite_clamp(image - bg * (1.0 - alpha), 0.0, 1.0)
 
 
 def _background_tensor(value, device: torch.device, dtype: torch.dtype) -> Tensor:
@@ -178,3 +184,10 @@ def _camera_ray_directions(camera: Camera) -> Tensor:
     )
     dirs_world = dirs_cam @ camera.c2w[:3, :3].T
     return torch.nn.functional.normalize(dirs_world, dim=-1)
+
+
+def _finite_clamp(value: Tensor, min_value: float, max_value: float) -> Tensor:
+    return torch.nan_to_num(value, nan=float(min_value), posinf=float(max_value), neginf=float(min_value)).clamp(
+        float(min_value),
+        float(max_value),
+    )

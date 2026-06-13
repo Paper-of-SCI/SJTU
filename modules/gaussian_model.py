@@ -148,6 +148,37 @@ class GaussianModel(nn.Module):
         """Return named raw parameters used by optimizer helpers."""
         return {name: getattr(self, name) for name in PARAMETER_NAMES}
 
+    def sanitize_parameters(
+        self,
+        min_log_scale: float = -12.0,
+        max_log_scale: float = 5.0,
+        max_feature_abs: float = 10.0,
+        max_opacity_logit_abs: float = 10.0,
+    ) -> int:
+        """Keep raw Gaussian parameters finite and inside conservative bounds.
+
+        Returns the number of non-finite entries that were replaced. Clamp-only
+        changes are intentionally not counted because they may happen routinely
+        near the configured bounds.
+        """
+        replaced = 0
+        with torch.no_grad():
+            replaced += _finite_inplace(self.means)
+            replaced += _finite_inplace(self.log_scales)
+            self.log_scales.clamp_(float(min_log_scale), float(max_log_scale))
+
+            replaced += _sanitize_quaternions_inplace(self.quats)
+            replaced += _finite_inplace(self.logit_opacities)
+            self.logit_opacities.clamp_(-float(max_opacity_logit_abs), float(max_opacity_logit_abs))
+
+            replaced += _finite_inplace(self.features_dc)
+            replaced += _finite_inplace(self.features_rest)
+            feature_limit = float(max_feature_abs)
+            if feature_limit > 0.0:
+                self.features_dc.clamp_(-feature_limit, feature_limit)
+                self.features_rest.clamp_(-feature_limit, feature_limit)
+        return int(replaced)
+
     def replace_tensors(self, tensors: Mapping[str, Tensor]) -> None:
         """Replace all raw parameter tensors and reset gradient statistics."""
         missing = [name for name in PARAMETER_NAMES if name not in tensors]
@@ -262,11 +293,12 @@ class GaussianModel(nn.Module):
             return
         grad = grad.reshape(-1, grad.shape[-1])[:, :2]
         norms = grad.norm(dim=-1)
+        finite_norms = torch.isfinite(norms)
         if indices is not None:
             indices = indices.reshape(-1).to(device=norms.device, dtype=torch.long)
             if indices.numel() != norms.numel():
                 return
-            valid = (indices >= 0) & (indices < self.num_gaussians)
+            valid = (indices >= 0) & (indices < self.num_gaussians) & finite_norms
             if visibility is not None:
                 visibility = visibility.reshape(-1).to(device=norms.device, dtype=torch.bool)
                 if visibility.numel() == norms.numel():
@@ -286,6 +318,7 @@ class GaussianModel(nn.Module):
             visibility = visibility.reshape(-1).to(device=norms.device, dtype=torch.bool)
             if visibility.numel() != norms.numel():
                 visibility = torch.ones_like(norms, dtype=torch.bool)
+        visibility = visibility & finite_norms
         self.gradient_accum[visibility] += norms[visibility]
         self.gradient_count[visibility] += 1
 
@@ -363,3 +396,25 @@ def _infer_count(values: Iterable[Tensor]) -> int:
         if int(tensor.shape[0]) != count:
             raise ValueError("all tensors must have the same first dimension")
     return count
+
+
+def _finite_inplace(tensor: Tensor, fallback: float = 0.0) -> int:
+    mask = ~torch.isfinite(tensor)
+    count = int(mask.sum().item()) if mask.numel() > 0 else 0
+    if count > 0:
+        tensor[mask] = float(fallback)
+    return count
+
+
+def _sanitize_quaternions_inplace(quats: Tensor, eps: float = 1.0e-8) -> int:
+    replaced = _finite_inplace(quats)
+    if quats.numel() == 0:
+        return replaced
+    norms = quats.norm(dim=-1, keepdim=True)
+    invalid = norms.squeeze(-1) < float(eps)
+    invalid_count = int(invalid.sum().item()) if invalid.numel() > 0 else 0
+    if invalid_count > 0:
+        quats[invalid] = quats.new_tensor([1.0, 0.0, 0.0, 0.0])
+        norms = quats.norm(dim=-1, keepdim=True)
+    quats.div_(norms.clamp_min(float(eps)))
+    return replaced + invalid_count
