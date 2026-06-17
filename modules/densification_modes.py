@@ -13,6 +13,11 @@ DENSIFICATION_MODE_CHOICES = (
     "patch_reallocate",
     "patch_reallocate_semantic",
 )
+PATCH_ONLY_DENSIFICATION_MODE_CHOICES = (
+    "standard",
+    STANDARD_MODE,
+    "patch_guided",
+)
 PATCH_DENSIFICATION_MODES = frozenset(
     {
         "patch_guided",

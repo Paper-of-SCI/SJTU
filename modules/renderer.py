@@ -7,7 +7,7 @@ from typing import Any, Dict, Literal, Optional
 
 import torch
 from torch import Tensor
-
+from gsplat import rasterization
 from modules.camera import Camera
 from modules.gaussian_model import GaussianModel
 
@@ -56,11 +56,7 @@ class GaussianRenderer:
         override_colors: Optional[Tensor] = None,
     ) -> RenderOutput:
         """Render one camera from one GaussianModel."""
-        try:
-            from gsplat import rasterization
-        except ImportError as exc:
-            raise ImportError("缺少 gsplat，请先安装与当前 PyTorch/CUDA 匹配的 gsplat。") from exc
-
+    
         tensors = model.activated_tensors()
         degree = model.sh_degree if sh_degree is None else min(int(sh_degree), model.sh_degree)
         raster_colors = tensors.colors
@@ -107,6 +103,18 @@ class GaussianRenderer:
         radii = meta.get("radii")
         means2d = meta.get("means2d")
         return RenderOutput(image=image, alpha=alpha, depth=depth, radii=radii, means2d=means2d, metadata=meta)
+
+    def render_ours(
+        self,
+        model: GaussianModel,
+        camera: Camera,
+        medium_field: "MediumField",
+        medium_config: "MediumRenderConfig",
+    ) -> "MediumRenderOutput":
+        """Render with the medium-aware ours formula through the shared boundary."""
+        from modules.medium_renderer import MediumRenderer
+
+        return MediumRenderer(self, medium_field, medium_config).render(model, camera)
 
 
 def _background_tensor(value: tuple[float, float, float] | Tensor, device: torch.device) -> Tensor:

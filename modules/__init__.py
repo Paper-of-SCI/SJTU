@@ -7,9 +7,12 @@ from modules.densification import (
     DensificationStats,
     PatchGuidedDensificationConfig,
     PatchGuidedDensificationController,
+    PatchOnlyDensificationConfig,
+    PatchOnlyDensificationController,
 )
 from modules.densification_modes import (
     DENSIFICATION_MODE_CHOICES,
+    PATCH_ONLY_DENSIFICATION_MODE_CHOICES,
     normalize_densification_mode,
     uses_patch_densifier,
     uses_reallocation,
@@ -48,6 +51,9 @@ __all__ = [
     "OptimConfig",
     "PatchGuidedDensificationConfig",
     "PatchGuidedDensificationController",
+    "PatchOnlyDensificationConfig",
+    "PatchOnlyDensificationController",
+    "PATCH_ONLY_DENSIFICATION_MODE_CHOICES",
     "RenderOutput",
     "BestMetricTracker",
     "build_lpips_evaluator",

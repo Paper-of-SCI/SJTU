@@ -12,8 +12,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-METHOD_DIR = Path(__file__).resolve().parent
-ROOT = METHOD_DIR.parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DENSIFY_GRAD_THRESHOLD = 2.0e-6
 
 if str(ROOT) not in sys.path:
@@ -26,7 +25,6 @@ from modules import (
     uses_semantic_importance,
     validate_semantic_importance_root,
 )
-from methods.ours_denstify.lpips_backend import LPIPS_BACKEND_CHOICES, TRAIN_LPIPS_BACKEND_CHOICES
 
 
 @dataclass(frozen=True)
@@ -55,17 +53,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--holdout-offset", type=int, default=0, help="Offset used when selecting every Nth held-out image.")
     parser.add_argument("--lpips", action="store_true", help="Compute LPIPS during test rendering.")
     parser.add_argument("--lpips-net", default="vgg", choices=["alex", "vgg", "squeeze"], help="LPIPS backbone used when --lpips is enabled.")
-    parser.add_argument("--lpips-backend", default="lpips", choices=list(LPIPS_BACKEND_CHOICES), help="LPIPS implementation forwarded to rendering.")
-    parser.add_argument("--train-lpips-weight", type=float, default=0.0, help="Differentiable LPIPS loss weight forwarded to training; 0 disables it.")
-    parser.add_argument("--train-lpips-start-step", type=int, default=7000, help="First training step that may include LPIPS loss.")
-    parser.add_argument("--train-lpips-max-size", type=int, default=512, help="Longest side used for differentiable training LPIPS loss; 0 keeps full resolution.")
-    parser.add_argument("--train-lpips-net", default="vgg", choices=["alex", "vgg", "squeeze"], help="LPIPS backbone used by training LPIPS loss.")
-    parser.add_argument(
-        "--train-lpips-backend",
-        default="seasplat",
-        choices=list(TRAIN_LPIPS_BACKEND_CHOICES),
-        help="LPIPS implementation used by training loss.",
-    )
+    parser.add_argument("--lpips-backend", default="lpips", choices=["lpips", "official_3dgs"], help="LPIPS implementation forwarded to rendering.")
     parser.add_argument("--out", default="outputs/3dgs_patch_curasao", help="Benchmark output directory.")
     parser.add_argument("--data-root", default="src/datasets/SeathruNeRF_dataset", help="Root directory for named scenes.")
     parser.add_argument("--log-every", type=int, default=100, help="Training log interval.")
@@ -83,8 +71,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patch-size", type=int, default=16, help="Patch size for patch-guided variants.")
     parser.add_argument("--patch-edge-weight", type=float, default=0.75, help="Edge multiplier for patch detail scoring.")
     parser.add_argument("--patch-detail-lambda", type=float, default=2.0, help="Patch detail multiplier on gradients.")
-    parser.add_argument("--patch-perceptual-weight", type=float, default=0.0, help="VGG residual weight added to patch detail scoring; 0 disables it.")
-    parser.add_argument("--patch-perceptual-max-size", type=int, default=768, help="Longest side used for VGG residual patch scoring.")
     parser.add_argument("--semantic-importance-root", default="", help="Root directory for semantic importance masks.")
     parser.add_argument("--semantic-base", type=float, default=0.2, help="Minimum semantic multiplier for semantic patch-guided variants.")
     parser.add_argument(
@@ -145,7 +131,7 @@ def run_variant(args: argparse.Namespace, data_dir: Path, scene_name: str, run_s
     save_every = 0 if args.csv_only else args.iterations
     train_cmd = [
         sys.executable,
-        str(METHOD_DIR / "train_3dgs_scene.py"),
+        str(ROOT / "methods/3dgs/train_3dgs_scene.py"),
         "--data",
         str(data_dir),
         "--out",
@@ -182,20 +168,6 @@ def run_variant(args: argparse.Namespace, data_dir: Path, scene_name: str, run_s
         str(args.patch_edge_weight),
         "--patch-detail-lambda",
         str(args.patch_detail_lambda),
-        "--patch-perceptual-weight",
-        str(args.patch_perceptual_weight),
-        "--patch-perceptual-max-size",
-        str(args.patch_perceptual_max_size),
-        "--train-lpips-weight",
-        str(args.train_lpips_weight),
-        "--train-lpips-start-step",
-        str(args.train_lpips_start_step),
-        "--train-lpips-max-size",
-        str(args.train_lpips_max_size),
-        "--train-lpips-net",
-        str(args.train_lpips_net),
-        "--train-lpips-backend",
-        str(args.train_lpips_backend),
         "--semantic-importance-root",
         str(args.semantic_importance_root),
         "--semantic-base",
@@ -220,7 +192,7 @@ def run_variant(args: argparse.Namespace, data_dir: Path, scene_name: str, run_s
     print(f"开始测试渲染：scene={scene_name} variant={variant} seed={seed}")
     render_cmd = [
         sys.executable,
-        str(METHOD_DIR / "render_3dgs_views.py"),
+        str(ROOT / "methods/3dgs/render_3dgs_views.py"),
         "--data",
         str(data_dir),
         "--checkpoint",
@@ -294,13 +266,6 @@ def build_summary_row(
         "patch_size": int(args.patch_size),
         "patch_edge_weight": float(args.patch_edge_weight),
         "patch_detail_lambda": float(args.patch_detail_lambda),
-        "patch_perceptual_weight": training.get("patch_perceptual_weight", float(args.patch_perceptual_weight)),
-        "patch_perceptual_max_size": training.get("patch_perceptual_max_size", int(args.patch_perceptual_max_size)),
-        "train_lpips_weight": training.get("train_lpips_weight", float(args.train_lpips_weight)),
-        "train_lpips_start_step": training.get("train_lpips_start_step", int(args.train_lpips_start_step)),
-        "train_lpips_max_size": training.get("train_lpips_max_size", int(args.train_lpips_max_size)),
-        "train_lpips_net": training.get("train_lpips_net", str(args.train_lpips_net) if args.train_lpips_weight > 0.0 else ""),
-        "train_lpips_backend": training.get("train_lpips_backend", str(args.train_lpips_backend) if args.train_lpips_weight > 0.0 else ""),
         "semantic_importance_root": training.get("semantic_importance_root"),
         "semantic_base": training.get("semantic_base", run_spec.semantic_base) if semantic_enabled else "",
         "uses_semantic_importance": semantic_enabled,
@@ -429,13 +394,6 @@ FULL_SUMMARY_FIELDS = [
         "patch_size",
         "patch_edge_weight",
         "patch_detail_lambda",
-        "patch_perceptual_weight",
-        "patch_perceptual_max_size",
-        "train_lpips_weight",
-        "train_lpips_start_step",
-        "train_lpips_max_size",
-        "train_lpips_net",
-        "train_lpips_backend",
         "semantic_importance_root",
         "semantic_base",
         "uses_semantic_importance",
@@ -472,9 +430,6 @@ FULL_SUMMARY_FIELDS = [
 COMPACT_SUMMARY_FIELDS = [
     "scene",
     "variant",
-    "patch_perceptual_weight",
-    "patch_perceptual_max_size",
-    "train_lpips_weight",
     "semantic_base",
     "seed",
     "psnr",

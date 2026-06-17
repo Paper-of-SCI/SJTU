@@ -98,17 +98,23 @@ from modules import (
     DensificationController,
     GaussianModel,
     GaussianRenderer,
+    MediumField,
+    MediumRenderConfig,
     OptimConfig,
     PatchGuidedDensificationConfig,
     PatchGuidedDensificationController,
     build_lpips_evaluator,
     build_3dgs_optimizer,
-    evaluate_cameras,
+    compute_image_metrics,
     exponential_lr,
     flatten_best_metric_fields,
+    mean_metrics,
+    medium_checkpoint_path_for_ply,
     normalize_densification_mode,
     photometric_loss,
+    scene_medium_config,
     set_group_lr,
+    underwater_loss,
     uses_patch_densifier,
     uses_reallocation,
     uses_semantic_importance,
@@ -127,76 +133,42 @@ def parse_args() -> argparse.Namespace:
 
     # 数据和输出路径。复现实验时通常只改 --data、--out、--iterations。
     # --data 指向单个 COLMAP scene；--out 每次实验都建议用新目录，避免覆盖旧结果。
-    parser.add_argument(
-        "--data", 
-        default="src/datasets/SeathruNeRF_dataset/Curasao", 
-        help="COLMAP scene directory."
-    )
-    parser.add_argument(
-        "--out", 
-        default="outputs/3dgs_Curasao", 
-        help="Output directory."
-    )
-    parser.add_argument(
-        "--iterations", 
-        type=int, 
-        default=19999, 
-        help="Training iterations."
-    )
+    parser.add_argument("--data", default="src/datasets/SeathruNeRF_dataset/Curasao", help="COLMAP scene directory.")
+    parser.add_argument("--out", default="outputs/3dgs_Curasao_renderVersion", help="Output directory.")
+    parser.add_argument("--iterations", type=int, default=19999, help="Training iterations.")
 
     # 分辨率控制优先级：
     # 1) 如果设置 --target-height 或 --target-width，就按目标边长缩放。
     # 2) 否则如果 --factor=-1，宽度 <=1600 用原图，宽度 >1600 自动压到 1600。
     # 3) 否则按整数 factor 做下采样。
     # 正式复现实验建议保留 --factor -1；显存不够时才临时用 target-width 降配。
-    parser.add_argument(
-        "--factor", 
-        type=int, 
-        default=-1, 
-        help="Image downscale factor for training; -1 keeps images at original size unless width exceeds 1600."
-    )
-    parser.add_argument(
-        "--target-height", 
-        type=int, 
-        default=0, 
-        help="Resize images to this height while preserving aspect ratio; 0 uses --factor."
-    )
-    parser.add_argument(
-        "--target-width", 
-        type=int, 
-        default=0, 
-        help="Resize images to this width while preserving aspect ratio; 0 uses --target-height or --factor."
-    )
+    parser.add_argument("--factor", type=int, default=-1, help="Image downscale factor for training; -1 keeps images at original size unless width exceeds 1600.")
+    parser.add_argument("--target-height", type=int, default=0, help="Resize images to this height while preserving aspect ratio; 0 uses --factor.")
+    parser.add_argument("--target-width", type=int, default=0, help="Resize images to this width while preserving aspect ratio; 0 uses --target-height or --factor.")
 
     # holdout 决定 train/test split。默认每 8 张取 1 张做 test；
     # render_3dgs_views.py 评估时必须使用相同 holdout 参数，否则 test 集不一致。
-    parser.add_argument(
-        "--holdout", 
-        type=int, 
-        default=8, 
-        help="Every Nth image is held out by the loader."
-    )
-    parser.add_argument(
-        "--holdout-offset", 
-        type=int, 
-        default=0, 
-        help="Offset used when selecting every Nth held-out image."
-    )
+    parser.add_argument("--holdout", type=int, default=8, help="Every Nth image is held out by the loader.")
+    parser.add_argument("--holdout-offset", type=int, default=0, help="Offset used when selecting every Nth held-out image.")
 
     # 模型和基础 loss。这里是 baseline 3DGS：只优化 Gaussian 参数，不含 medium field。
     # photometric_loss = L1 + DSSIM，其中 --lambda-dssim 控制 DSSIM 权重。
-    parser.add_argument(
-        "--sh-degree", 
-        type=int, 
-        default=3, 
-        help="Maximum spherical harmonics degree."
-    )
-    parser.add_argument(
-        "--lambda-dssim", 
-        type=float, 
-        default=0.2, 
-        help="Photometric DSSIM weight."
-    )
+    parser.add_argument("--sh-degree", type=int, default=3, help="Maximum spherical harmonics degree.")
+    parser.add_argument("--lambda-dssim", type=float, default=0.2, help="Photometric DSSIM weight.")
+    parser.add_argument("--disable-medium", action="store_true", help="Disable the 3D medium field and train plain 3DGS.")
+    parser.add_argument("--medium-lr", type=float, default=2.0e-4, help="Learning rate for the medium field.")
+    parser.add_argument("--medium-samples", type=int, default=4, help="Uniform ray samples used for medium integration.")
+    parser.add_argument("--medium-hidden-dim", type=int, default=32, help="Hidden dimension of the low-capacity medium MLP.")
+    parser.add_argument("--medium-density-bias", type=float, default=-4.0, help="Bias applied before softplus extinction density activation.")
+    parser.add_argument("--medium-far", type=float, default=0.0, help="Fallback medium integration distance; 0 uses scene_extent*4.")
+    parser.add_argument("--medium-chunk-pixels", type=int, default=65536, help="Pixel chunk size for medium ray integration.")
+    parser.add_argument("--medium-alpha-threshold", type=float, default=1.0e-3, help="Alpha threshold for choosing rendered depth over fallback medium far.")
+    parser.add_argument("--medium-max-density", type=float, default=10.0, help="Clamp maximum medium attenuation/scattering density.")
+    parser.add_argument("--medium-max-optical-depth", type=float, default=80.0, help="Clamp maximum exponent magnitude for medium transmittance.")
+    parser.add_argument("--lambda-medium", type=float, default=1.0e-3, help="Weight for medium density smooth/sparse regularization.")
+    parser.add_argument("--lambda-beta", type=float, default=1.0e-2, help="L1 density weight inside the medium regularizer.")
+    parser.add_argument("--lambda-decor", type=float, default=1.0e-2, help="Weight for the medium/object edge decorrelation loss.")
+    parser.add_argument("--medium-warmup-steps", type=int, default=0, help="Delay medium regularization and decorrelation losses for N steps.")
 
     # 训练过程输出：
     # --save-every 控制 preview PNG 和 checkpoint PLY；
@@ -240,7 +212,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clone-jitter-scale", type=float, default=0.05, help="Scale-relative position jitter for patch-guided clones.")
 
     # eval LPIPS 只用于 held-out evaluation，不参与训练反传。
-    # 如果只想快速验证训练链路，可以不加 --eval-lpips，避免额外模型加载和耗时。
+    # 默认关闭，正式需要 LPIPS 指标时才显式加 --eval-lpips。
     parser.add_argument("--eval-lpips", action="store_false", help="Compute LPIPS during held-out training evaluation.")
     parser.add_argument("--lpips-net", default="vgg", choices=["alex", "vgg", "squeeze"], help="LPIPS backbone used when --eval-lpips is enabled.")
     parser.add_argument(
@@ -326,9 +298,13 @@ def main() -> None:
     )
     # renderer 只负责把 Gaussian + Camera 渲染成图片；白色背景和多数 3DGS 实现保持一致。
     renderer = GaussianRenderer(background=(1.0, 1.0, 1.0))
+    medium_field = build_medium_field(args, scene, device)
+    medium_config = build_medium_config(args, scene) if medium_field is not None else None
 
     # optimizer 直接优化 Gaussian 的 raw 参数：means、SH 颜色、opacity、scale、rotation。
     optimizer = build_3dgs_optimizer(model, OptimConfig())
+    if medium_field is not None:
+        optimizer.add_param_group({"params": list(medium_field.parameters()), "lr": float(args.medium_lr), "name": "medium"})
 
     # 位置学习率单独做指数衰减：前期让 Gaussian 多移动，后期收小步长精修。
     position_lr = exponential_lr(1.6e-4, 1.6e-6, max_steps=args.iterations, delay_steps=1000, delay_mult=0.01)
@@ -395,6 +371,13 @@ def main() -> None:
         ("heldout_eval_every", str(args.eval_every)),
         ("eval_lpips", str(eval_lpips_enabled)),
         ("lpips_backend", args.lpips_backend if eval_lpips_enabled else ""),
+        ("medium_field", "disabled" if medium_field is None else "enabled"),
+        ("medium_samples", "" if medium_field is None else str(args.medium_samples)),
+        ("medium_hidden_dim", "" if medium_field is None else str(args.medium_hidden_dim)),
+        ("medium_lr", "" if medium_field is None else f"{args.medium_lr:g}"),
+        ("lambda_medium", "" if medium_field is None else f"{args.lambda_medium:g}"),
+        ("lambda_beta", "" if medium_field is None else f"{args.lambda_beta:g}"),
+        ("lambda_decor", "" if medium_field is None else f"{args.lambda_decor:g}"),
         ("输出目录", str(out_dir)),
     ]
     print_training_config_table(rows)
@@ -455,13 +438,27 @@ def main() -> None:
 
             # 前向：当前 Gaussian 从当前相机视角渲染一张图。
             # render.image 是 CHW RGB；render.means2d/radii 会在 densification 中继续使用。
-            render = renderer.render(model, camera)
-            
-            
+            render = render_training_view(renderer, model, camera, medium_field, medium_config)
 
             # 图像监督：渲染图和 GT 图计算 L1 + DSSIM。
             # clamp 只约束送入 loss 的 RGB 范围，避免异常值扩大损失；GT 已在 loader 中归一化到 [0, 1]。
-            loss, parts = photometric_loss(render.image.clamp(0.0, 1.0), gt_image, lambda_dssim=args.lambda_dssim)
+            if medium_field is None:
+                loss, parts = photometric_loss(render.image.clamp(0.0, 1.0), gt_image, lambda_dssim=args.lambda_dssim)
+            else:
+                effective_lambda_medium = args.lambda_medium if step > int(args.medium_warmup_steps) else 0.0
+                effective_lambda_decor = args.lambda_decor if step > int(args.medium_warmup_steps) else 0.0
+                loss, parts = underwater_loss(
+                    render.image.clamp(0.0, 1.0),
+                    gt_image,
+                    render.rgb_object,
+                    render.rgb_medium,
+                    render.metadata["medium_density_l1"],
+                    render.metadata["medium_density_smooth"],
+                    lambda_dssim=args.lambda_dssim,
+                    lambda_medium=effective_lambda_medium,
+                    lambda_beta=args.lambda_beta,
+                    lambda_decor=effective_lambda_decor,
+                )
 
             # 反向传播会把图像误差传回 Gaussian 参数，然后 Adam 更新这些参数。
             # 注意 densification 用的是本轮 backward 后累积到 means2d 的屏幕空间梯度。
@@ -517,11 +514,12 @@ def main() -> None:
                 dashboard_state["eval_status"] = "评估中..."
                 dashboard_state["eval_step"] = str(step)
                 live.update(render_training_dashboard(training_progress, dashboard_state), refresh=True)
-                eval_metrics = evaluate_cameras(model, renderer, test_cameras, lpips_evaluator)
+                eval_metrics = evaluate_rendered_cameras(model, renderer, test_cameras, lpips_evaluator, medium_field, medium_config)
                 improved = best_tracker.update(step, eval_metrics)
                 for metric_name in improved:
                     best_checkpoint = best_dir / f"best_{metric_name}.ply"
                     save_checkpoint(best_checkpoint, model)
+                    save_medium_checkpoint(medium_checkpoint_path_for_ply(best_checkpoint), medium_field)
                     best_tracker.set_checkpoint(metric_name, str(best_checkpoint))
                 save_best_metrics(best_metrics_path, best_tracker.to_dict())
                 improved_text = ",".join(improved) if improved else "-"
@@ -545,7 +543,9 @@ def main() -> None:
                 # 保存当前训练视角预览图和 Gaussian 参数 checkpoint。
                 # preview 用来肉眼检查训练是否崩坏；checkpoint 可用于中途恢复分析，但本脚本不实现 resume。
                 save_preview(preview_dir / f"step_{step:06d}.png", render.image)
-                save_checkpoint(checkpoint_dir / f"step_{step:06d}.ply", model)
+                checkpoint_path = checkpoint_dir / f"step_{step:06d}.ply"
+                save_checkpoint(checkpoint_path, model)
+                save_medium_checkpoint(medium_checkpoint_path_for_ply(checkpoint_path), medium_field)
                 dashboard_state["artifacts"] = f"step={step} preview + checkpoint"
 
             training_progress.update(progress_task, completed=step)
@@ -553,7 +553,9 @@ def main() -> None:
 
     elapsed = time.perf_counter() - started_at
     # final.ply 是最后一步模型；如果启用了 eval_every，best/*.ply 可能比 final.ply 指标更好。
-    save_checkpoint(out_dir / "final.ply", model)
+    final_checkpoint = out_dir / "final.ply"
+    save_checkpoint(final_checkpoint, model)
+    save_medium_checkpoint(medium_checkpoint_path_for_ply(final_checkpoint), medium_field)
     save_training_summary(
         out_dir / "training_summary.json",
         args,
@@ -565,6 +567,66 @@ def main() -> None:
     )
     console.print(Rule("[bold blue]训练结束", style="blue"))
     console.print(f"训练完成：最终模型已保存到 {out_dir / 'final.ply'}，总耗时 {format_duration(elapsed)}")
+
+
+def build_medium_field(args: argparse.Namespace, scene, device: torch.device) -> MediumField | None:
+    """Create the optional medium field for the ours render boundary."""
+    if bool(args.disable_medium):
+        return None
+    config = scene_medium_config(
+        scene.point_cloud_xyz,
+        scene.c2w_matrices[:, :3, 3],
+        num_samples=args.medium_samples,
+        hidden_dim=args.medium_hidden_dim,
+        density_bias=args.medium_density_bias,
+    )
+    return MediumField(config).to(device)
+
+
+def build_medium_config(args: argparse.Namespace, scene) -> MediumRenderConfig:
+    """Build the narrow medium render config consumed by GaussianRenderer.render_ours."""
+    far_distance = float(args.medium_far) if float(args.medium_far) > 0.0 else float(scene.scene_extent) * 4.0
+    return MediumRenderConfig(
+        far_distance=max(far_distance, 1.0e-3),
+        chunk_pixels=max(int(args.medium_chunk_pixels), 1),
+        alpha_threshold=max(float(args.medium_alpha_threshold), 0.0),
+        max_density=max(float(args.medium_max_density), 0.0),
+        max_optical_depth=max(float(args.medium_max_optical_depth), 1.0),
+    )
+
+
+def render_training_view(
+    renderer: GaussianRenderer,
+    model: GaussianModel,
+    camera: Camera,
+    medium_field: MediumField | None,
+    medium_config: MediumRenderConfig | None,
+):
+    """Render through the selected 3dgs_render_version boundary."""
+    if medium_field is None:
+        return renderer.render(model, camera)
+    if medium_config is None:
+        raise RuntimeError("medium_field 已启用，但缺少 medium_config。")
+    return renderer.render_ours(model, camera, medium_field, medium_config)
+
+
+@torch.no_grad()
+def evaluate_rendered_cameras(
+    model: GaussianModel,
+    renderer: GaussianRenderer,
+    cameras: list[Camera],
+    lpips_evaluator,
+    medium_field: MediumField | None,
+    medium_config: MediumRenderConfig | None,
+) -> dict[str, float | None]:
+    """Evaluate cameras with the same render boundary used by training."""
+    rows = []
+    for camera in cameras:
+        if camera.image is None:
+            raise RuntimeError(f"相机缺少 GT 图像，无法计算评估指标: {camera.image_path}")
+        render = render_training_view(renderer, model, camera, medium_field, medium_config)
+        rows.append(compute_image_metrics(render.image, camera.image, lpips_evaluator))
+    return mean_metrics(rows)
 
 
 def build_cameras(scene, device: torch.device) -> list[Camera]:
@@ -597,6 +659,14 @@ def save_checkpoint(path: Path, model: GaussianModel) -> None:
             model.features_rest.detach().cpu().numpy(),
         )
     write_ply(str(path), data)
+
+
+def save_medium_checkpoint(path: Path, medium_field: MediumField | None) -> None:
+    """Save the optional medium sidecar checkpoint."""
+    if medium_field is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(medium_field.checkpoint_payload(), path)
 
 
 def should_save_training_artifacts(step: int, iterations: int, save_every: int) -> bool:
@@ -657,6 +727,21 @@ def save_training_summary(
         "uses_semantic_importance": bool(uses_semantic_importance(args.densification_mode)),
         "reallocate_fraction": float(effective_reallocate_fraction),
         "clone_jitter_scale": float(args.clone_jitter_scale),
+        "medium_enabled": not bool(args.disable_medium),
+        "medium_lr": float(args.medium_lr),
+        "medium_samples": int(args.medium_samples),
+        "medium_hidden_dim": int(args.medium_hidden_dim),
+        "medium_density_bias": float(args.medium_density_bias),
+        "medium_far": float(args.medium_far),
+        "medium_chunk_pixels": int(args.medium_chunk_pixels),
+        "medium_alpha_threshold": float(args.medium_alpha_threshold),
+        "medium_max_density": float(args.medium_max_density),
+        "medium_max_optical_depth": float(args.medium_max_optical_depth),
+        "lambda_medium": float(args.lambda_medium),
+        "lambda_beta": float(args.lambda_beta),
+        "lambda_decor": float(args.lambda_decor),
+        "medium_warmup_steps": int(args.medium_warmup_steps),
+        "medium_checkpoint": str(out_dir / "medium.pt") if not bool(args.disable_medium) else "",
         "best_metrics_json": str(out_dir / "best_metrics.json") if best_metrics else "",
         "final_gaussians": int(final_gaussians),
         "elapsed_seconds": float(elapsed_seconds),
@@ -741,7 +826,7 @@ def render_training_dashboard(progress: Progress, state: dict[str, str]) -> Pane
     body = Table.grid(expand=True)
     body.add_row(progress)
     body.add_row(columns)
-    return Panel(body, title="3DGS 训练监控", border_style="blue")
+    return Panel(body, title="3DGS renderVersion 训练监控", border_style="blue")
 
 
 def sample_system_status() -> dict[str, str]:

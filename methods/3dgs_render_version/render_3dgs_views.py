@@ -19,7 +19,6 @@ from modules import (
     GaussianRenderer,
     MediumField,
     MediumRenderConfig,
-    MediumRenderer,
     build_lpips_evaluator,
     compute_image_metrics,
     medium_checkpoint_path_for_ply,
@@ -42,6 +41,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--holdout", type=int, default=8, help="Holdout interval.")
     parser.add_argument("--holdout-offset", type=int, default=0, help="Offset used when selecting every Nth held-out image.")
     parser.add_argument("--max-images", type=int, default=0, help="Limit rendered image count; 0 means all.")
+    parser.add_argument("--medium-checkpoint", default="", help="Optional medium sidecar checkpoint; defaults to checkpoint-derived path.")
+    parser.add_argument("--disable-medium", action="store_true", help="Render with plain 3DGS even if a medium checkpoint exists.")
+    parser.add_argument("--medium-far", type=float, default=0.0, help="Fallback medium integration distance; 0 uses scene_extent*4.")
+    parser.add_argument("--medium-chunk-pixels", type=int, default=65536, help="Pixel chunk size for medium ray integration.")
+    parser.add_argument("--medium-alpha-threshold", type=float, default=1.0e-3, help="Alpha threshold for choosing rendered depth over fallback medium far.")
+    parser.add_argument("--medium-max-density", type=float, default=10.0, help="Clamp maximum medium attenuation/scattering density.")
+    parser.add_argument("--medium-max-optical-depth", type=float, default=80.0, help="Clamp maximum exponent magnitude for medium transmittance.")
     parser.add_argument("--lpips", action="store_true", help="Also compute LPIPS if the lpips package is installed.")
     parser.add_argument("--lpips-net", default="vgg", choices=["alex", "vgg", "squeeze"], help="LPIPS backbone used when --lpips is enabled.")
     parser.add_argument(
@@ -50,11 +56,6 @@ def parse_args() -> argparse.Namespace:
         choices=["lpips", "official_3dgs"],
         help="LPIPS implementation. official_3dgs matches graphdeco gaussian-splatting metrics.py.",
     )
-    parser.add_argument("--disable-medium", action="store_true", help="Render the plain 3DGS checkpoint without a medium sidecar.")
-    parser.add_argument("--medium-checkpoint", default="", help="Medium field checkpoint; empty auto-detects next to the PLY checkpoint.")
-    parser.add_argument("--medium-far", type=float, default=0.0, help="Fallback medium integration distance; 0 uses scene_extent*4.")
-    parser.add_argument("--medium-chunk-pixels", type=int, default=65536, help="Pixel chunk size for medium ray integration.")
-    parser.add_argument("--medium-alpha-threshold", type=float, default=1.0e-3, help="Alpha threshold for choosing rendered depth over fallback medium far.")
     parser.add_argument("--no-save-images", action="store_true", help="Only write metrics.csv; do not save render/GT PNG images.")
     return parser.parse_args()
 
@@ -82,9 +83,9 @@ def main() -> None:
         opengl=False,
     )
     model = load_gaussian_checkpoint(checkpoint, device)
-    base_renderer = GaussianRenderer(background=(1.0, 1.0, 1.0))
+    renderer = GaussianRenderer(background=(1.0, 1.0, 1.0))
     medium_field, medium_path = load_medium_for_render(args, checkpoint, device)
-    renderer = build_active_renderer(args, base_renderer, medium_field, scene)
+    medium_config = build_medium_config(args, scene) if medium_field is not None else None
     lpips_evaluator = build_lpips_evaluator(device, args.lpips_net, args.lpips_backend) if args.lpips else None
 
     count = len(scene.image_paths) if args.max_images <= 0 else min(args.max_images, len(scene.image_paths))
@@ -103,7 +104,7 @@ def main() -> None:
     for index in range(count):
         camera = Camera.from_scene_data(scene, index, device=device, load_image=True)
         with torch.no_grad():
-            render = renderer.render(model, camera)
+            render = render_view(renderer, model, camera, medium_field, medium_config)
         image = render.image.detach().clamp(0.0, 1.0)
         gt = camera.image.detach()
         image = resize_to_gt_if_needed(image, gt)
@@ -159,6 +160,7 @@ def load_gaussian_checkpoint(path: Path, device: torch.device) -> GaussianModel:
 
 
 def load_medium_for_render(args: argparse.Namespace, checkpoint: Path, device: torch.device) -> tuple[MediumField | None, Path | None]:
+    """Load the optional medium checkpoint for the ours render boundary."""
     if bool(args.disable_medium):
         return None, None
     if args.medium_checkpoint:
@@ -174,19 +176,31 @@ def load_medium_for_render(args: argparse.Namespace, checkpoint: Path, device: t
     return MediumField.from_checkpoint_payload(payload, device), medium_path
 
 
-def build_active_renderer(args: argparse.Namespace, renderer: GaussianRenderer, medium_field: MediumField | None, scene):
-    if medium_field is None:
-        return renderer
+def build_medium_config(args: argparse.Namespace, scene) -> MediumRenderConfig:
+    """Build the narrow medium render config consumed by GaussianRenderer.render_ours."""
     far_distance = float(args.medium_far) if float(args.medium_far) > 0.0 else float(scene.scene_extent) * 4.0
-    return MediumRenderer(
-        renderer,
-        medium_field,
-        MediumRenderConfig(
-            far_distance=max(far_distance, 1.0e-3),
-            chunk_pixels=max(int(args.medium_chunk_pixels), 1),
-            alpha_threshold=max(float(args.medium_alpha_threshold), 0.0),
-        ),
+    return MediumRenderConfig(
+        far_distance=max(far_distance, 1.0e-3),
+        chunk_pixels=max(int(args.medium_chunk_pixels), 1),
+        alpha_threshold=max(float(args.medium_alpha_threshold), 0.0),
+        max_density=max(float(args.medium_max_density), 0.0),
+        max_optical_depth=max(float(args.medium_max_optical_depth), 1.0),
     )
+
+
+def render_view(
+    renderer: GaussianRenderer,
+    model: GaussianModel,
+    camera: Camera,
+    medium_field: MediumField | None,
+    medium_config: MediumRenderConfig | None,
+):
+    """Render through the selected 3dgs_render_version boundary."""
+    if medium_field is None:
+        return renderer.render(model, camera)
+    if medium_config is None:
+        raise RuntimeError("medium_field 已启用，但缺少 medium_config。")
+    return renderer.render_ours(model, camera, medium_field, medium_config)
 
 
 def save_metrics_csv(path: Path, rows: list[dict], include_lpips: bool) -> None:

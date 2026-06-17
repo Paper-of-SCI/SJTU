@@ -23,6 +23,7 @@ class OptimConfig:
 
 def build_3dgs_optimizer(model: GaussianModel, config: OptimConfig | None = None) -> torch.optim.Adam:
     """Build Adam with standard 3DGS parameter groups."""
+    print(model.means)
     config = config or OptimConfig()
     groups = [
         {"params": [model.means], "lr": config.position_lr, "name": "means"},

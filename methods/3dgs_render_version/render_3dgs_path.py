@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from modules import Camera, GaussianModel, GaussianRenderer, MediumField, MediumRenderConfig, MediumRenderer, medium_checkpoint_path_for_ply
+from modules import Camera, GaussianModel, GaussianRenderer, MediumField, MediumRenderConfig, medium_checkpoint_path_for_ply
 from utils.dataset_loaders import load_colmap_dataset
 from utils.image_utils import save_image
 from utils.ply_io import ply_dict_to_gaussians, read_ply
@@ -28,15 +28,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", default="train", choices=["train", "test", "val"], help="Reference camera split.")
     parser.add_argument("--factor", type=int, default=-1, help="Image downscale factor; -1 keeps images at original size unless width exceeds 1600.")
     parser.add_argument("--holdout", type=int, default=8, help="Holdout interval.")
+    parser.add_argument("--medium-checkpoint", default="", help="Optional medium sidecar checkpoint; defaults to checkpoint-derived path.")
+    parser.add_argument("--disable-medium", action="store_true", help="Render with plain 3DGS even if a medium checkpoint exists.")
+    parser.add_argument("--medium-far", type=float, default=0.0, help="Fallback medium integration distance; 0 uses scene_extent*4.")
+    parser.add_argument("--medium-chunk-pixels", type=int, default=65536, help="Pixel chunk size for medium ray integration.")
+    parser.add_argument("--medium-alpha-threshold", type=float, default=1.0e-3, help="Alpha threshold for choosing rendered depth over fallback medium far.")
+    parser.add_argument("--medium-max-density", type=float, default=10.0, help="Clamp maximum medium attenuation/scattering density.")
+    parser.add_argument("--medium-max-optical-depth", type=float, default=80.0, help="Clamp maximum exponent magnitude for medium transmittance.")
     parser.add_argument("--frames", type=int, default=60, help="Number of frames to render.")
     parser.add_argument("--start", type=int, default=0, help="Start camera index for interpolate mode.")
     parser.add_argument("--end", type=int, default=-1, help="End camera index for interpolate mode; -1 means last camera.")
     parser.add_argument("--radius-scale", type=float, default=1.0, help="Orbit radius multiplier for orbit mode.")
-    parser.add_argument("--disable-medium", action="store_true", help="Render the plain 3DGS checkpoint without a medium sidecar.")
-    parser.add_argument("--medium-checkpoint", default="", help="Medium field checkpoint; empty auto-detects next to the PLY checkpoint.")
-    parser.add_argument("--medium-far", type=float, default=0.0, help="Fallback medium integration distance; 0 uses scene_extent*4.")
-    parser.add_argument("--medium-chunk-pixels", type=int, default=65536, help="Pixel chunk size for medium ray integration.")
-    parser.add_argument("--medium-alpha-threshold", type=float, default=1.0e-3, help="Alpha threshold for choosing rendered depth over fallback medium far.")
     return parser.parse_args()
 
 
@@ -53,9 +55,9 @@ def main() -> None:
     device = torch.device("cuda")
     scene = load_colmap_dataset(str(data_dir), split=args.split, load_images=False, factor=args.factor, holdout=args.holdout, opengl=False)
     model = load_gaussian_checkpoint(checkpoint, device)
-    base_renderer = GaussianRenderer(background=(1.0, 1.0, 1.0))
+    renderer = GaussianRenderer(background=(1.0, 1.0, 1.0))
     medium_field, medium_path = load_medium_for_render(args, checkpoint, device)
-    renderer = build_active_renderer(args, base_renderer, medium_field, scene)
+    medium_config = build_medium_config(args, scene) if medium_field is not None else None
 
     cameras = build_path_cameras(args, scene, device)
     print(f"设备：CUDA GPU='{torch.cuda.get_device_name(device)}'")
@@ -66,7 +68,7 @@ def main() -> None:
 
     for index, camera in enumerate(cameras):
         with torch.no_grad():
-            render = renderer.render(model, camera)
+            render = render_view(renderer, model, camera, medium_field, medium_config)
         save_image(str(out_dir / f"frame_{index:04d}.png"), render.image.detach().clamp(0.0, 1.0).permute(1, 2, 0).cpu().numpy())
         print(f"[{index + 1}/{len(cameras)}] frame_{index:04d}.png")
 
@@ -213,10 +215,13 @@ def load_gaussian_checkpoint(path: Path, device: torch.device) -> GaussianModel:
 
 
 def load_medium_for_render(args: argparse.Namespace, checkpoint: Path, device: torch.device) -> tuple[MediumField | None, Path | None]:
+    """Load the optional medium checkpoint for the ours render boundary."""
     if bool(args.disable_medium):
         return None, None
     if args.medium_checkpoint:
         medium_path = resolve_input_path(args.medium_checkpoint)
+        if not medium_path.exists():
+            raise FileNotFoundError(f"找不到 medium checkpoint: {medium_path}")
     else:
         medium_path = medium_checkpoint_path_for_ply(checkpoint)
         if not medium_path.exists():
@@ -226,19 +231,31 @@ def load_medium_for_render(args: argparse.Namespace, checkpoint: Path, device: t
     return MediumField.from_checkpoint_payload(payload, device), medium_path
 
 
-def build_active_renderer(args: argparse.Namespace, renderer: GaussianRenderer, medium_field: MediumField | None, scene):
-    if medium_field is None:
-        return renderer
+def build_medium_config(args: argparse.Namespace, scene) -> MediumRenderConfig:
+    """Build the narrow medium render config consumed by GaussianRenderer.render_ours."""
     far_distance = float(args.medium_far) if float(args.medium_far) > 0.0 else float(scene.scene_extent) * 4.0
-    return MediumRenderer(
-        renderer,
-        medium_field,
-        MediumRenderConfig(
-            far_distance=max(far_distance, 1.0e-3),
-            chunk_pixels=max(int(args.medium_chunk_pixels), 1),
-            alpha_threshold=max(float(args.medium_alpha_threshold), 0.0),
-        ),
+    return MediumRenderConfig(
+        far_distance=max(far_distance, 1.0e-3),
+        chunk_pixels=max(int(args.medium_chunk_pixels), 1),
+        alpha_threshold=max(float(args.medium_alpha_threshold), 0.0),
+        max_density=max(float(args.medium_max_density), 0.0),
+        max_optical_depth=max(float(args.medium_max_optical_depth), 1.0),
     )
+
+
+def render_view(
+    renderer: GaussianRenderer,
+    model: GaussianModel,
+    camera: Camera,
+    medium_field: MediumField | None,
+    medium_config: MediumRenderConfig | None,
+):
+    """Render through the selected 3dgs_render_version boundary."""
+    if medium_field is None:
+        return renderer.render(model, camera)
+    if medium_config is None:
+        raise RuntimeError("medium_field 已启用，但缺少 medium_config。")
+    return renderer.render_ours(model, camera, medium_field, medium_config)
 
 
 def resolve_input_path(path: str) -> Path:

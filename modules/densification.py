@@ -8,15 +8,17 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Dict, Optional, TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
 from modules.gaussian_model import GaussianModel, PARAMETER_NAMES, quats_to_rotmats
-from modules.perceptual_detail import VGG16PerceptualPatchScorer
 from modules.renderer import RenderOutput
+
+if TYPE_CHECKING:
+    from modules.perceptual_detail import VGG16PerceptualPatchScorer
 
 
 @dataclass
@@ -63,6 +65,23 @@ class PatchGuidedDensificationConfig:
     perceptual_max_size: int = 768
     semantic_base: float = 0.2
     reallocate_fraction: float = 0.0
+    clone_jitter_scale: float = 0.05
+    eps: float = 1.0e-6
+
+
+@dataclass
+class PatchOnlyDensificationConfig:
+    """Patch-only public densification contract.
+
+    This interface intentionally exposes only error/edge patch guidance. It
+    keeps semantic, reallocation and perceptual scoring out of the caller's
+    surface area so other 3DGS entrypoints can swap it in directly.
+    """
+
+    densification: DensificationConfig = field(default_factory=DensificationConfig)
+    patch_size: int = 16
+    edge_weight: float = 0.75
+    detail_lambda: float = 2.0
     clone_jitter_scale: float = 0.05
     eps: float = 1.0e-6
 
@@ -171,7 +190,7 @@ class PatchGuidedDensificationController:
         self.config = config or PatchGuidedDensificationConfig()
         self._detail_accum: Optional[Tensor] = None
         self._detail_count: Optional[Tensor] = None
-        self._perceptual_scorer: Optional[VGG16PerceptualPatchScorer] = None
+        self._perceptual_scorer: Optional["VGG16PerceptualPatchScorer"] = None
 
     def update(
         self,
@@ -260,7 +279,9 @@ class PatchGuidedDensificationController:
             max_size=self.config.perceptual_max_size,
         )
 
-    def _get_perceptual_scorer(self, device: torch.device) -> VGG16PerceptualPatchScorer:
+    def _get_perceptual_scorer(self, device: torch.device) -> "VGG16PerceptualPatchScorer":
+        from modules.perceptual_detail import VGG16PerceptualPatchScorer
+
         if self._perceptual_scorer is None:
             self._perceptual_scorer = VGG16PerceptualPatchScorer(eps=self.config.eps).to(device)
         else:
@@ -338,6 +359,45 @@ class PatchGuidedDensificationController:
             reallocated=reallocated,
             patch_detail_mean=detail_mean,
             patch_detail_max=detail_max,
+        )
+
+
+class PatchOnlyDensificationController:
+    """Patch error/edge guided densification with a narrow public input."""
+
+    def __init__(self, config: PatchOnlyDensificationConfig | None = None) -> None:
+        self.config = config or PatchOnlyDensificationConfig()
+        self._controller = PatchGuidedDensificationController(
+            PatchGuidedDensificationConfig(
+                densification=self.config.densification,
+                patch_size=self.config.patch_size,
+                edge_weight=self.config.edge_weight,
+                detail_lambda=self.config.detail_lambda,
+                perceptual_weight=0.0,
+                perceptual_max_size=0,
+                semantic_base=1.0,
+                reallocate_fraction=0.0,
+                clone_jitter_scale=self.config.clone_jitter_scale,
+                eps=self.config.eps,
+            )
+        )
+
+    def update(
+        self,
+        model: GaussianModel,
+        render_output: RenderOutput,
+        optimizer: torch.optim.Optimizer,
+        step: int,
+        gt_image: Tensor,
+    ) -> DensificationStats:
+        """Accumulate patch-only detail and optionally mutate Gaussians."""
+        return self._controller.update(
+            model,
+            render_output,
+            optimizer,
+            step,
+            gt_image,
+            semantic_importance=None,
         )
 
 

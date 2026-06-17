@@ -3,3 +3,5 @@ Pillow
 scipy
 gsplat
 tqdm
+rich
+psutil

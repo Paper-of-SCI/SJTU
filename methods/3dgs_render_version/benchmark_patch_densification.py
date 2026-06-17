@@ -56,18 +56,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lpips-backend", default="lpips", choices=["lpips", "official_3dgs"], help="LPIPS implementation forwarded to rendering.")
     parser.add_argument("--out", default="outputs/3dgs_patch_curasao", help="Benchmark output directory.")
     parser.add_argument("--data-root", default="src/datasets/SeathruNeRF_dataset", help="Root directory for named scenes.")
-    parser.add_argument("--disable-medium", action="store_true", help="Disable the ours medium field and run plain 3DGS.")
-    parser.add_argument("--medium-lr", type=float, default=1.0e-3, help="Learning rate for the medium field.")
-    parser.add_argument("--medium-samples", type=int, default=16, help="Uniform ray samples used for medium integration.")
-    parser.add_argument("--medium-hidden-dim", type=int, default=32, help="Hidden dimension of the low-capacity medium MLP.")
-    parser.add_argument("--medium-density-bias", type=float, default=-4.0, help="Bias applied before medium extinction softplus.")
-    parser.add_argument("--medium-far", type=float, default=0.0, help="Fallback medium integration distance; 0 uses scene_extent*4.")
-    parser.add_argument("--medium-chunk-pixels", type=int, default=65536, help="Pixel chunk size for medium ray integration.")
-    parser.add_argument("--medium-alpha-threshold", type=float, default=1.0e-3, help="Alpha threshold for choosing rendered depth over fallback medium far.")
-    parser.add_argument("--lambda-medium", type=float, default=1.0e-3, help="Weight for medium density smooth/sparse regularization.")
-    parser.add_argument("--lambda-beta", type=float, default=1.0e-2, help="L1 density weight inside the medium regularizer.")
-    parser.add_argument("--lambda-decor", type=float, default=1.0e-2, help="Weight for the medium/object edge decorrelation loss.")
-    parser.add_argument("--medium-warmup-steps", type=int, default=0, help="Delay medium regularization and decorrelation losses for N steps.")
     parser.add_argument("--log-every", type=int, default=100, help="Training log interval.")
     parser.add_argument("--train-eval-every", type=int, default=1000, help="Held-out training evaluation interval; 0 disables best checkpoint tracking.")
     parser.add_argument(
@@ -143,7 +131,7 @@ def run_variant(args: argparse.Namespace, data_dir: Path, scene_name: str, run_s
     save_every = 0 if args.csv_only else args.iterations
     train_cmd = [
         sys.executable,
-        str(ROOT / "methods/ours/train_3dgs_scene.py"),
+        str(ROOT / "methods/3dgs/train_3dgs_scene.py"),
         "--data",
         str(data_dir),
         "--out",
@@ -188,28 +176,6 @@ def run_variant(args: argparse.Namespace, data_dir: Path, scene_name: str, run_s
         str(args.reallocate_fraction),
         "--clone-jitter-scale",
         str(args.clone_jitter_scale),
-        "--medium-lr",
-        str(args.medium_lr),
-        "--medium-samples",
-        str(args.medium_samples),
-        "--medium-hidden-dim",
-        str(args.medium_hidden_dim),
-        "--medium-density-bias",
-        str(args.medium_density_bias),
-        "--medium-far",
-        str(args.medium_far),
-        "--medium-chunk-pixels",
-        str(args.medium_chunk_pixels),
-        "--medium-alpha-threshold",
-        str(args.medium_alpha_threshold),
-        "--lambda-medium",
-        str(args.lambda_medium),
-        "--lambda-beta",
-        str(args.lambda_beta),
-        "--lambda-decor",
-        str(args.lambda_decor),
-        "--medium-warmup-steps",
-        str(args.medium_warmup_steps),
         "--save-every",
         str(save_every),
         "--eval-every",
@@ -219,8 +185,6 @@ def run_variant(args: argparse.Namespace, data_dir: Path, scene_name: str, run_s
     ]
     if args.lpips and train_eval_every > 0:
         train_cmd.extend(["--eval-lpips", "--lpips-net", str(args.lpips_net), "--lpips-backend", str(args.lpips_backend)])
-    if args.disable_medium:
-        train_cmd.append("--disable-medium")
     run_command(train_cmd)
     if not final_ply.exists():
         raise FileNotFoundError(f"训练未生成 final.ply: {final_ply}")
@@ -228,7 +192,7 @@ def run_variant(args: argparse.Namespace, data_dir: Path, scene_name: str, run_s
     print(f"开始测试渲染：scene={scene_name} variant={variant} seed={seed}")
     render_cmd = [
         sys.executable,
-        str(ROOT / "methods/ours/render_3dgs_views.py"),
+        str(ROOT / "methods/3dgs/render_3dgs_views.py"),
         "--data",
         str(data_dir),
         "--checkpoint",
@@ -247,19 +211,11 @@ def run_variant(args: argparse.Namespace, data_dir: Path, scene_name: str, run_s
         str(args.holdout),
         "--holdout-offset",
         str(args.holdout_offset),
-        "--medium-far",
-        str(args.medium_far),
-        "--medium-chunk-pixels",
-        str(args.medium_chunk_pixels),
-        "--medium-alpha-threshold",
-        str(args.medium_alpha_threshold),
     ]
     if args.lpips:
         render_cmd.extend(["--lpips", "--lpips-net", str(args.lpips_net), "--lpips-backend", str(args.lpips_backend)])
     if args.csv_only:
         render_cmd.append("--no-save-images")
-    if args.disable_medium:
-        render_cmd.append("--disable-medium")
     run_command(render_cmd)
     if not metrics_csv.exists():
         raise FileNotFoundError(f"测试渲染未生成 metrics.csv: {metrics_csv}")
@@ -269,7 +225,6 @@ def run_variant(args: argparse.Namespace, data_dir: Path, scene_name: str, run_s
     if args.csv_only:
         cleanup_csv_only_artifacts(run_dir)
         row["final_ply"] = ""
-        row["medium_checkpoint"] = ""
     print(
         f"完成：scene={scene_name} variant={variant} seed={seed} "
         f"PSNR={row['psnr']:.3f} SSIM={row['ssim']:.4f} L1={row['l1']:.5f} "
@@ -315,19 +270,6 @@ def build_summary_row(
         "semantic_base": training.get("semantic_base", run_spec.semantic_base) if semantic_enabled else "",
         "uses_semantic_importance": semantic_enabled,
         "reallocate_fraction": training.get("reallocate_fraction", float(args.reallocate_fraction)),
-        "medium_enabled": training.get("medium_enabled", not bool(args.disable_medium)),
-        "medium_lr": training.get("medium_lr", float(args.medium_lr)),
-        "medium_samples": training.get("medium_samples", int(args.medium_samples)),
-        "medium_hidden_dim": training.get("medium_hidden_dim", int(args.medium_hidden_dim)),
-        "medium_density_bias": training.get("medium_density_bias", float(args.medium_density_bias)),
-        "medium_far": training.get("medium_far", float(args.medium_far)),
-        "medium_chunk_pixels": training.get("medium_chunk_pixels", int(args.medium_chunk_pixels)),
-        "medium_alpha_threshold": training.get("medium_alpha_threshold", float(args.medium_alpha_threshold)),
-        "lambda_medium": training.get("lambda_medium", float(args.lambda_medium)),
-        "lambda_beta": training.get("lambda_beta", float(args.lambda_beta)),
-        "lambda_decor": training.get("lambda_decor", float(args.lambda_decor)),
-        "medium_warmup_steps": training.get("medium_warmup_steps", int(args.medium_warmup_steps)),
-        "medium_checkpoint": training.get("medium_checkpoint", str(run_dir / "train" / "medium.pt") if (run_dir / "train" / "medium.pt").exists() else ""),
         "densify_grad_threshold": float(args.densify_grad_threshold),
         "densify_start_step": training.get("densify_start_step"),
         "densify_stop_step": training.get("densify_stop_step"),
@@ -397,9 +339,6 @@ def is_run_complete(csv_only: bool, final_ply: Path, metrics_csv: Path, training
 def cleanup_csv_only_artifacts(run_dir: Path) -> None:
     patterns = [
         "train/final.ply",
-        "train/medium.pt",
-        "train/checkpoints/*_medium.pt",
-        "train/best/*_medium.pt",
         "train/checkpoints/*.ply",
         "train/best/*.ply",
         "train/previews/*.png",
@@ -459,19 +398,6 @@ FULL_SUMMARY_FIELDS = [
         "semantic_base",
         "uses_semantic_importance",
         "reallocate_fraction",
-        "medium_enabled",
-        "medium_lr",
-        "medium_samples",
-        "medium_hidden_dim",
-        "medium_density_bias",
-        "medium_far",
-        "medium_chunk_pixels",
-        "medium_alpha_threshold",
-        "lambda_medium",
-        "lambda_beta",
-        "lambda_decor",
-        "medium_warmup_steps",
-        "medium_checkpoint",
         "densify_grad_threshold",
         "densify_start_step",
         "densify_stop_step",

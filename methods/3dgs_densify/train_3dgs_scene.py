@@ -92,15 +92,15 @@ SYSTEM_STATUS_SAMPLE_INTERVAL = 2.0
 
 from modules import (
     BestMetricTracker,
-    DENSIFICATION_MODE_CHOICES,
+    PATCH_ONLY_DENSIFICATION_MODE_CHOICES,
     Camera,
     DensificationConfig,
     DensificationController,
     GaussianModel,
     GaussianRenderer,
     OptimConfig,
-    PatchGuidedDensificationConfig,
-    PatchGuidedDensificationController,
+    PatchOnlyDensificationConfig,
+    PatchOnlyDensificationController,
     build_lpips_evaluator,
     build_3dgs_optimizer,
     evaluate_cameras,
@@ -109,12 +109,7 @@ from modules import (
     normalize_densification_mode,
     photometric_loss,
     set_group_lr,
-    uses_patch_densifier,
-    uses_reallocation,
-    uses_semantic_importance,
-    validate_semantic_importance_root,
 )
-from methods.semantic_importance import SemanticImportanceProvider
 from utils.dataset_loaders import load_colmap_dataset
 from utils.image_utils import compute_psnr, save_image
 from utils.ply_io import gaussians_to_ply_dict, write_ply
@@ -134,7 +129,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--out", 
-        default="outputs/3dgs_Curasao", 
+        default="outputs/3dgs_Curasao_densifyVersion", 
         help="Output directory."
     )
     parser.add_argument(
@@ -208,12 +203,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0, help="Random seed.")
 
     # densification 是 3DGS 训练的关键阶段：根据屏幕空间梯度 clone/split/prune Gaussian。
-    # standard_3dgs 是 baseline；patch_guided 等模式会把图像 patch 细节用于引导致密化。
+    # patch_guided 是默认主路径；standard_3dgs 仅保留为 baseline 对照。
     parser.add_argument(
         "--densification-mode",
-        default="standard_3dgs",
-        choices=list(DENSIFICATION_MODE_CHOICES),
-        help="Densification strategy. standard and standard_3dgs are the baseline path.",
+        default="patch_guided",
+        choices=list(PATCH_ONLY_DENSIFICATION_MODE_CHOICES),
+        help="Densification strategy. patch_guided uses error/edge patch detail; standard and standard_3dgs are baseline paths.",
     )
     parser.add_argument(
         "--densify-grad-threshold",
@@ -226,17 +221,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--densify-interval", type=int, default=100, help="Densification interval in iterations.")
     parser.add_argument("--opacity-reset-interval", type=int, default=0, help="Opacity reset interval during the densification phase; 0 disables resets.")
 
-    # patch-guided densification 参数只在对应 densification-mode 下生效。
+    # patch-guided densification 参数只在 patch_guided 下生效。
     # standard_3dgs 下保留这些参数不会改变训练结果。
-    parser.add_argument("--patch-size", type=int, default=16, help="Patch size for patch-guided densification.")
+    parser.add_argument("--patch-size", type=int, default=32, help="Patch size for patch-guided densification.")
     parser.add_argument("--patch-edge-weight", type=float, default=0.75, help="Edge multiplier for patch detail scoring.")
     parser.add_argument("--patch-detail-lambda", type=float, default=2.0, help="Patch detail multiplier on screen-space gradients.")
-
-    # semantic importance 只在 semantic 相关 densification-mode 下生效。
-    # 如果模式需要 semantic mask，validate_semantic_importance_root 会在训练前直接报错。
-    parser.add_argument("--semantic-importance-root", default="", help="Root directory for per-image semantic importance masks.")
-    parser.add_argument("--semantic-base", type=float, default=0.2, help="Minimum semantic multiplier for semantic patch-guided densification.")
-    parser.add_argument("--reallocate-fraction", type=float, default=0.10, help="Low-detail Gaussian fraction to reallocate in patch_reallocate modes.")
     parser.add_argument("--clone-jitter-scale", type=float, default=0.05, help="Scale-relative position jitter for patch-guided clones.")
 
     # eval LPIPS 只用于 held-out evaluation，不参与训练反传。
@@ -348,8 +337,19 @@ def main() -> None:
         min_opacity=0.005,
         opacity_reset_interval=max(int(args.opacity_reset_interval), 0),
     )
-    
-    densifier = DensificationController(densify_config)
+    patch_densifier_enabled = args.densification_mode == "patch_guided"
+    if patch_densifier_enabled:
+        densifier = PatchOnlyDensificationController(
+            PatchOnlyDensificationConfig(
+                densification=densify_config,
+                patch_size=args.patch_size,
+                edge_weight=args.patch_edge_weight,
+                detail_lambda=args.patch_detail_lambda,
+                clone_jitter_scale=args.clone_jitter_scale,
+            )
+        )
+    else:
+        densifier = DensificationController(densify_config)
 
     # 把 SceneData 中的每张图封装成 Camera。Camera 内部会按需读取 GT 图像到 GPU。
     # 如果显存紧张，优先降低分辨率；不要在训练 loop 内频繁改 Camera 构造逻辑。
@@ -471,7 +471,10 @@ def main() -> None:
             stats = None
             if not args.disable_densification:
                 # 用本轮反传得到的屏幕空间梯度决定是否 clone/split/prune。
-                stats = densifier.update(model, render, optimizer, step)
+                if patch_densifier_enabled:
+                    stats = densifier.update(model, render, optimizer, step, gt_image)
+                else:
+                    stats = densifier.update(model, render, optimizer, step)
 
             step_elapsed = time.perf_counter() - step_started_at
             
@@ -621,7 +624,6 @@ def save_training_summary(
     best_metrics: dict | None = None,
 ) -> None:
     """Persist narrow run metadata consumed by benchmark aggregation."""
-    effective_reallocate_fraction = args.reallocate_fraction if uses_reallocation(args.densification_mode) else 0.0
     best_fields = flatten_best_metric_fields(best_metrics)
     summary = {
         "data": str(data_dir),
@@ -648,14 +650,10 @@ def save_training_summary(
         "patch_size": int(args.patch_size),
         "patch_edge_weight": float(args.patch_edge_weight),
         "patch_detail_lambda": float(args.patch_detail_lambda),
-        "semantic_importance_root": (
-            str(resolve_input_path(args.semantic_importance_root))
-            if args.semantic_importance_root and uses_semantic_importance(args.densification_mode)
-            else ""
-        ),
-        "semantic_base": float(args.semantic_base),
-        "uses_semantic_importance": bool(uses_semantic_importance(args.densification_mode)),
-        "reallocate_fraction": float(effective_reallocate_fraction),
+        "semantic_importance_root": "",
+        "semantic_base": "",
+        "uses_semantic_importance": False,
+        "reallocate_fraction": 0.0,
         "clone_jitter_scale": float(args.clone_jitter_scale),
         "best_metrics_json": str(out_dir / "best_metrics.json") if best_metrics else "",
         "final_gaussians": int(final_gaussians),
@@ -741,7 +739,7 @@ def render_training_dashboard(progress: Progress, state: dict[str, str]) -> Pane
     body = Table.grid(expand=True)
     body.add_row(progress)
     body.add_row(columns)
-    return Panel(body, title="3DGS 训练监控", border_style="blue")
+    return Panel(body, title="3DGS DensifyVesion 训练监控", border_style="blue")
 
 
 def sample_system_status() -> dict[str, str]:
@@ -810,7 +808,6 @@ def format_densification_stats(stats) -> str:
                 f"clone={stats.cloned}",
                 f"split={stats.split}",
                 f"prune={stats.pruned}",
-                f"realloc={stats.reallocated}",
                 f"total={stats.total}",
                 f"high_grad={stats.high_grad}",
                 f"grad_max={stats.grad_max:.2e}",

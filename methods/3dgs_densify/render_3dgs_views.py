@@ -17,10 +17,10 @@ from modules import (
     Camera,
     GaussianModel,
     GaussianRenderer,
+    build_lpips_evaluator,
     compute_image_metrics,
     resize_to_gt_if_needed,
 )
-from methods.ours_denstify.lpips_backend import LPIPS_BACKEND_CHOICES, build_ours_lpips_evaluator
 from utils.dataset_loaders import load_colmap_dataset
 from utils.image_utils import save_image
 from utils.ply_io import ply_dict_to_gaussians, read_ply
@@ -43,8 +43,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--lpips-backend",
         default="lpips",
-        choices=list(LPIPS_BACKEND_CHOICES),
-        help="LPIPS implementation. seasplat calls methods/seasplat/lpipsPyTorch.",
+        choices=["lpips", "official_3dgs"],
+        help="LPIPS implementation. official_3dgs matches graphdeco gaussian-splatting metrics.py.",
     )
     parser.add_argument("--no-save-images", action="store_true", help="Only write metrics.csv; do not save render/GT PNG images.")
     return parser.parse_args()
@@ -74,7 +74,7 @@ def main() -> None:
     )
     model = load_gaussian_checkpoint(checkpoint, device)
     renderer = GaussianRenderer(background=(1.0, 1.0, 1.0))
-    lpips_evaluator = build_ours_lpips_evaluator(device, args.lpips_net, args.lpips_backend) if args.lpips else None
+    lpips_evaluator = build_lpips_evaluator(device, args.lpips_net, args.lpips_backend) if args.lpips else None
 
     count = len(scene.image_paths) if args.max_images <= 0 else min(args.max_images, len(scene.image_paths))
     metric_rows = []
