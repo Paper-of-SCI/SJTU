@@ -9,3 +9,22 @@ __pycache__/
 
 # Local training/evaluation outputs
 outputs/
+runs/
+wandb/
+
+# Local CUDA/PyTorch build and wheel artifacts
+methods/**/.cuda-*/
+methods/**/wheels*/
+*.whl
+build/
+dist/
+*.egg-info/
+
+# Model checkpoints and training logs
+*.pth
+*.pt
+*.ckpt
+events.out.tfevents.*
+
+# Dataset-local experiment outputs
+src/datasets/**/experiments/
