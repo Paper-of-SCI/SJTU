@@ -1,17 +1,24 @@
+from dataclasses import dataclass
 from pathlib import Path
+import random
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
 
+from methods.leo_3DGS.functions.metrics import LPIPSEvaluator, evaluate_image_metrics
 from methods.leo_3DGS.functions.initialGS import main_initialize_gaussians_from_point_cloud
 from methods.leo_3DGS.functions.render import GaussianModel, render_original_cuda
+from methods.leo_3DGS.functions.metrics import save_gaussian_projection_debug
+from methods.leo_3DGS.adapters.loss.raw3DGS import raw_3dgs_loss
 from methods.leo_3DGS.utils_.loadData import (
-    load_colmap_cameras_bin, 
-    load_colmap_images_bin, 
+    ColmapCameraData,
+    ColmapImageData,
+    compute_scene_extent_from_colmap_images,
+    load_colmap_cameras_bin,
+    load_colmap_images_bin,
     load_gt_image,
-    compute_scene_extent_from_colmap_images
 )
 from methods.leo_3DGS.adapters.densification.raw3DGS import (
     accumulate_densification_stats,
@@ -20,18 +27,27 @@ from methods.leo_3DGS.adapters.densification.raw3DGS import (
     reset_opacity,
 )
 
+
+@dataclass(frozen=True)
+class TrainingView:
+    image: ColmapImageData
+    camera: ColmapCameraData
+    gt_image: torch.Tensor
+
+
 def create_optimizer(model: GaussianModel):
     return torch.optim.Adam(
         [
-            {"params": [model.means], "lr": 1.6e-4},
-            {"params": [model.features_dc], "lr": 2.5e-3},
-            {"params": [model.features_rest], "lr": 1.25e-4},
-            {"params": [model.opacity_logits], "lr": 5.0e-2},
-            {"params": [model.log_scales], "lr": 5.0e-3},
-            {"params": [model.rotations], "lr": 1.0e-3},
+            {"params": [model.means], "lr": 1.2e-3},
+            {"params": [model.features_dc], "lr": 1.2e-3},
+            {"params": [model.features_rest], "lr": 1.25e-3},
+            {"params": [model.opacity_logits], "lr": 2e-3},
+            {"params": [model.log_scales], "lr": 2.0e-3},
+            {"params": [model.rotations], "lr": 2.0e-3},
         ],
         eps=1e-15,
     )
+
 
 def save_render(rendered: torch.Tensor, path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -42,81 +58,226 @@ def save_render(rendered: torch.Tensor, path: Path):
 
     Image.fromarray(image).save(path)
 
+
+def scaled_camera(camera: ColmapCameraData, max_image_size: int | None) -> ColmapCameraData:
+    if max_image_size is None or max_image_size <= 0:
+        return camera
+
+    longest_side = max(camera.width, camera.height)
+    scale = min(1.0, float(max_image_size) / float(longest_side))
+
+    if scale == 1.0:
+        return camera
+
+    if camera.model == "PINHOLE":
+        params = camera.params.copy()
+        params[:4] *= scale
+    elif camera.model == "SIMPLE_PINHOLE":
+        params = camera.params.copy()
+        params[:3] *= scale
+    else:
+        raise ValueError(f"image scaling only supports PINHOLE/SIMPLE_PINHOLE cameras, got {camera.model}")
+
+    return ColmapCameraData(
+        camera_id=camera.camera_id,
+        model=camera.model,
+        width=int(round(camera.width * scale)),
+        height=int(round(camera.height * scale)),
+        params=params,
+    )
+
+
+def build_view_cache(
+    sparse_root: Path,
+    image_root: Path,
+    device: torch.device,
+    max_image_size: int | None = 1600,
+    test_every: int = 8,
+    cache_images_on_gpu: bool = True,
+) -> tuple[list[TrainingView], list[TrainingView], list[ColmapImageData]]:
+    cameras_para = load_colmap_cameras_bin(sparse_root / "cameras.bin")
+    images_para = load_colmap_images_bin(sparse_root / "images.bin")
+    all_images = sorted(images_para.values(), key=lambda x: x.name)
+
+    if not all_images:
+        raise ValueError("COLMAP images.bin contains no images")
+
+    image_device = device if cache_images_on_gpu else torch.device("cpu")
+    views: list[TrainingView] = []
+
+    for image_para in all_images:
+        camera_para = scaled_camera(cameras_para[image_para.camera_id], max_image_size)
+        gt_image = load_gt_image(image_root / image_para.name, camera_para, image_device)
+
+        if not cache_images_on_gpu and device.type == "cuda":
+            gt_image = gt_image.pin_memory()
+
+        views.append(
+            TrainingView(
+                image=image_para,
+                camera=camera_para,
+                gt_image=gt_image,
+            )
+        )
+
+    if test_every <= 0:
+        train_views = views
+        test_views = []
+    else:
+        test_views = views[::test_every]
+        train_views = [view for i, view in enumerate(views) if i % test_every != 0]
+
+    if not train_views:
+        raise ValueError("train_views is empty; use a larger dataset or set test_every <= 0")
+
+    return train_views, test_views, all_images
+
+
+def move_gt_to_device(view: TrainingView, device: torch.device) -> torch.Tensor:
+    gt_device = view.gt_image.device
+    if gt_device.type == device.type and (device.index is None or gt_device.index == device.index):
+        return view.gt_image
+    return view.gt_image.to(device, non_blocking=True)
+
+
 def main():
     device = torch.device("cuda")
-    dataset_root = Path("src/datasets/SeathruNeRF_dataset/Curasao/undistorted_pinhole")
+    dataset_root = Path("src/datasets/SeathruNeRF_dataset/IUI3-RedSea/undistorted_pinhole")
     sparse_root = dataset_root / "sparse" / "0"
     image_root = dataset_root / "images"
-    output_root = Path("outputs/leo_3DGS/train_one_image")
-    
+    output_root = Path("outputs/leo_3DGS/train_views")
+
+    max_epochs = 20000
+    max_image_size = 1600
+    test_every = 8
+    cache_images_on_gpu = True
+    save_interval = 1000
+    densify_from_iter = 500
+    densify_until_iter = 9000
+    densification_interval = 100
+    opacity_reset_interval = 3000
+    opacity_reset_until = 6000
+
     data = main_initialize_gaussians_from_point_cloud(str(sparse_root / "points3D.bin"))
     model = GaussianModel(data).to(device)
     model.train()
+
+    train_views, test_views, all_images = build_view_cache(
+        sparse_root=sparse_root,
+        image_root=image_root,
+        device=device,
+        max_image_size=max_image_size,
+        test_every=test_every,
+        cache_images_on_gpu=cache_images_on_gpu,
+    )
     
-    cameras_para = load_colmap_cameras_bin(sparse_root / "cameras.bin")
-    images_para = load_colmap_images_bin(sparse_root / "images.bin")
-    
-    image_para = sorted(images_para.values(), key=lambda x: x.name)[0]
-    camera_para = cameras_para[image_para.camera_id]
-    
-    label_image = load_gt_image(image_root / image_para.name, camera_para, device)
-    
+    #下面这两行会只训练一张图片
+    train_views = [train_views[0]]
+    test_views = []
+
+    lpips_evaluator = LPIPSEvaluator(net_type="vgg", device=device)
     optimizer = create_optimizer(model)
     bg_color = torch.zeros(3, device=device)
     densify_state = create_densification_state(model, percent_dense=0.01)
-    scene_extent = compute_scene_extent_from_colmap_images(images_para)
-    
-    for iteration in range(1, 20001):
-        pkg = render_original_cuda(
-            model=model,
-            image=image_para,
-            camera=camera_para,
-            bg_color=bg_color,
-            sh_degree=3,
-        )
-        
-        rendered = pkg["render"]  # [3, H, W]
-        
-        loss = F.l1_loss(rendered, label_image)
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        
-        
-        accumulate_densification_stats(densify_state, pkg)
+    scene_extent = compute_scene_extent_from_colmap_images([view.image for view in train_views])
 
-        if iteration > 500 and iteration % 100 == 0 and iteration < 9000:
-            densify_state = densification_step(
+    print(
+        f"train_views={len(train_views)}, test_views={len(test_views)}, "
+        f"total_images={len(all_images)}, max_image_size={max_image_size}"
+    )
+
+    global_step = 0
+
+    for epoch in range(1, max_epochs + 1):
+        epoch_views = train_views.copy()
+        random.shuffle(epoch_views)
+
+        for view in epoch_views:
+            global_step += 1
+            label_image = move_gt_to_device(view, device)
+
+            pkg = render_original_cuda(
                 model=model,
-                optimizer=optimizer,
-                state=densify_state,
-                scene_extent=scene_extent,
-                max_grad=0.0002,
-                min_opacity=0.005,
-                max_screen_size=None,
+                image=view.image,
+                camera=view.camera,
+                bg_color=bg_color,
+                sh_degree=3,
             )
 
-        if iteration % 3000 == 0 and iteration < 6001:
-            reset_opacity(model, optimizer)
-        
-        optimizer.step()
-        
-        
-        
-        
-        # with torch.no_grad():
-        #     model.opacity_logits.clamp_(min=-10.0, max=10.0)
-        #     model.log_scales.clamp_(min=-8.0, max=2.0)
+            rendered = pkg["render"]  # [3, H, W]
+            if rendered.shape != label_image.shape:
+                raise RuntimeError(
+                    f"render shape {tuple(rendered.shape)} does not match label shape {tuple(label_image.shape)}"
+                )
 
-        if iteration == 1 or iteration % 1000 == 0:
-            out_path = output_root / f"render_{iteration:04d}.png"
-            save_render(rendered, out_path)
-            print(f"iter={iteration:04d}, loss={loss.item():.6f}, saved={out_path}")
+            loss_result = raw_3dgs_loss(
+                rendered=rendered,
+                target=label_image,
+                lambda_dssim=0.2,
+            )
+            loss = loss_result.loss
 
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
 
+            if densify_from_iter < global_step < densify_until_iter:
+                accumulate_densification_stats(densify_state, pkg)
 
+            if (
+                densify_from_iter < global_step < densify_until_iter
+                and global_step % densification_interval == 0
+            ):
+                densify_state = densification_step(
+                    model=model,
+                    optimizer=optimizer,
+                    state=densify_state,
+                    scene_extent=scene_extent,
+                    max_grad=0.0002,
+                    min_opacity=0.005,
+                    max_screen_size=None,
+                )
 
+            if global_step % opacity_reset_interval == 0 and global_step <= opacity_reset_until:
+                reset_opacity(model, optimizer)
+
+            optimizer.step()
+            
+            if global_step == 1 or global_step % 100 == 0:
+                metrics = evaluate_image_metrics(
+                    rendered=rendered,
+                    target=label_image,
+                    lpips_evaluator=lpips_evaluator,
+                )
+                print(
+                    "step", global_step,
+                    "loss", loss.item(),
+                    "num_gaussians", model.means.shape[0],
+                    "visible", pkg["visibility_filter"].sum().item(),
+                    "alpha_mean", pkg["alpha"].mean().item(),
+                    "alpha_max", pkg["alpha"].max().item(),
+                    f"psnr={metrics.psnr:.4f}, "
+                    f"ssim={metrics.ssim:.4f}, "
+                    f"lpips={metrics.lpips:.4f}, "
+                )
+                
+
+            if global_step == 1 or global_step % save_interval == 0:
+                out_path = output_root / f"render_step_{global_step:06d}.png"
+                save_render(rendered, out_path)
+                print(
+                    f"epoch={epoch:04d}, step={global_step:06d}, "
+                    f"image={view.image.name}, loss={loss.item():.6f}, saved={out_path}"
+                )
+                save_gaussian_projection_debug(
+                    model=model,
+                    image=view.image,
+                    camera=view.camera,
+                    background=label_image,
+                    output_path=output_root / f"projection_step_{global_step:06d}.png",
+                    point_color=(255, 0, 0),
+                    point_radius=1,
+                    stride=1,
+                )
+                            
 if __name__ == "__main__":
-    
-    
     main()
-   

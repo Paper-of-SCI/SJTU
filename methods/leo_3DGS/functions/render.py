@@ -577,16 +577,16 @@ def render_original_cuda(
     
 if __name__ == "__main__":
     # 这里可以进行一些简单的测试，例如创建一个 GaussianModel 实例，检查参数的形状等。
-    data = main_initialize_gaussians_from_point_cloud("src/datasets/SeathruNeRF_dataset/Curasao/undistorted_pinhole/sparse/0/points3D.bin")
+    data = main_initialize_gaussians_from_point_cloud("src/datasets/SeathruNeRF_dataset/IUI3-RedSea/undistorted_pinhole/sparse/0/points3D.bin")
     model = GaussianModel(data).cuda()
     
 
     cameras = load_colmap_cameras_bin(
-        "src/datasets/SeathruNeRF_dataset/Curasao/undistorted_pinhole/sparse/0/cameras.bin"
+        "src/datasets/SeathruNeRF_dataset/IUI3-RedSea/undistorted_pinhole/sparse/0/cameras.bin"
     )
 
     images = load_colmap_images_bin(
-        "src/datasets/SeathruNeRF_dataset/Curasao/undistorted_pinhole/sparse/0/images.bin"
+        "src/datasets/SeathruNeRF_dataset/IUI3-RedSea/undistorted_pinhole/sparse/0/images.bin"
     )
     
     # 图片按照命名排序
@@ -610,39 +610,39 @@ if __name__ == "__main__":
     
   
 
-    pkg = render_original_cuda(
-        model=model,
-        image=image,
-        camera=camera,
-        bg_color=torch.zeros(3, device="cuda"),
-        sh_degree=3,
-    )
+    # pkg = render_original_cuda(
+    #     model=model,
+    #     image=image,
+    #     camera=camera,
+    #     bg_color=torch.zeros(3, device="cuda"),
+    #     sh_degree=3,
+    # )
 
-    rendered = pkg["render"]  # [3, H, W]
-    rendered_image = rendered.detach().clamp(0.0, 1.0)
-    rendered_image = rendered_image.permute(1, 2, 0)  # [3, H, W] -> [H, W, 3]
-    rendered_image = (rendered_image.cpu().numpy() * 255).astype(np.uint8)
+    # rendered = pkg["render"]  # [3, H, W]
+    # rendered_image = rendered.detach().clamp(0.0, 1.0)
+    # rendered_image = rendered_image.permute(1, 2, 0)  # [3, H, W] -> [H, W, 3]
+    # rendered_image = (rendered_image.cpu().numpy() * 255).astype(np.uint8)
 
-    Image.fromarray(rendered_image).save("render_cuda.png")
+    # Image.fromarray(rendered_image).save("render_cuda.png")
 
     
     
-    # '''
-    # 以下是验证gs球投影到图片上的二维点是否正确的代码。
-    # '''
-    # image_path = "src/datasets/SeathruNeRF_dataset/Curasao/undistorted_pinhole/images/" + image.name
+    '''
+    以下是验证gs球投影到图片上的二维点是否正确的代码。
+    '''
+    image_path = "src/datasets/SeathruNeRF_dataset/IUI3-RedSea/undistorted_pinhole/images/" + image.name
 
-    # gt = Image.open(image_path).convert("RGB")
-    # canvas = np.array(gt)
+    gt = Image.open(image_path).convert("RGB")
+    canvas = np.array(gt)
     
-    # points_2d = pixels[valid].detach().cpu().numpy()
+    points_2d = pixels[valid].detach().cpu().numpy()
 
-    # for u, v in points_2d:  # 每 20 个画一个，避免太密
-    #     u = int(round(u))
-    #     v = int(round(v))
+    for u, v in points_2d:  # 每 20 个画一个，避免太密
+        u = int(round(u))
+        v = int(round(v))
 
-    #     if 0 <= u < camera.width and 0 <= v < camera.height:
-    #         canvas[max(v - 1, 0): min(v + 2, camera.height),
-    #             max(u - 1, 0): min(u + 2, camera.width)] = [255, 0, 0]
-    # out = Image.fromarray(canvas)
-    # out.save("projection_debug.png")
+        if 0 <= u < camera.width and 0 <= v < camera.height:
+            canvas[max(v - 1, 0): min(v + 2, camera.height),
+                max(u - 1, 0): min(u + 2, camera.width)] = [255, 0, 0]
+    out = Image.fromarray(canvas)
+    out.save("projection_debug.png")
