@@ -124,7 +124,7 @@ def parse_args() -> argparse.Namespace:
     # --data 指向单个 COLMAP scene；--out 每次实验都建议用新目录，避免覆盖旧结果。
     parser.add_argument(
         "--data", 
-        default="src/datasets/SeathruNeRF_dataset/Curasao", 
+        default="src/datasets/SeathruNeRF_dataset/Curasao/undistorted_pinhole", 
         help="COLMAP scene directory."
     )
     parser.add_argument(

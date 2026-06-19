@@ -12,6 +12,7 @@ from methods.leo_3DGS.functions.initialGS import main_initialize_gaussians_from_
 from methods.leo_3DGS.functions.render import GaussianModel, render_original_cuda
 from methods.leo_3DGS.functions.metrics import save_gaussian_projection_debug
 from methods.leo_3DGS.adapters.loss.raw3DGS import raw_3dgs_loss
+from methods.leo_3DGS.adapters.loss.adjustraw3DGS import adjust_raw_3dgs_loss
 from methods.leo_3DGS.utils_.loadData import (
     ColmapCameraData,
     ColmapImageData,
@@ -26,7 +27,11 @@ from methods.leo_3DGS.adapters.densification.raw3DGS import (
     densification_step,
     reset_opacity,
 )
-
+from methods.leo_3DGS.functions.metrics import LPIPSEvaluator
+from methods.leo_3DGS.adapters.loss.adjustraw3DGS import (
+    LPIPSLoss,
+    adjust_raw_3dgs_loss,
+)
 
 @dataclass(frozen=True)
 class TrainingView:
@@ -36,14 +41,20 @@ class TrainingView:
 
 
 def create_optimizer(model: GaussianModel):
+    position_lr = 1.6e-4
+    feature_lr = 2.5e-3
+    opacity_lr = 5.0e-2
+    scaling_lr = 5.0e-3
+    rotation_lr = 1.0e-3
+
     return torch.optim.Adam(
         [
-            {"params": [model.means], "lr": 1.2e-3},
-            {"params": [model.features_dc], "lr": 1.2e-3},
-            {"params": [model.features_rest], "lr": 1.25e-3},
-            {"params": [model.opacity_logits], "lr": 2e-3},
-            {"params": [model.log_scales], "lr": 2.0e-3},
-            {"params": [model.rotations], "lr": 2.0e-3},
+            {"params": [model.means], "lr": position_lr},
+            {"params": [model.features_dc], "lr": feature_lr},
+            {"params": [model.features_rest], "lr": feature_lr / 20.0},
+            {"params": [model.opacity_logits], "lr": opacity_lr},
+            {"params": [model.log_scales], "lr": scaling_lr},
+            {"params": [model.rotations], "lr": rotation_lr},
         ],
         eps=1e-15,
     )
@@ -140,9 +151,87 @@ def move_gt_to_device(view: TrainingView, device: torch.device) -> torch.Tensor:
     return view.gt_image.to(device, non_blocking=True)
 
 
+@torch.no_grad()
+def evaluate_test_set(
+    model: GaussianModel,
+    test_views: list[TrainingView],
+    device: torch.device,
+    bg_color: torch.Tensor,
+    lpips_evaluator: LPIPSEvaluator,
+    output_root: Path,
+    global_step: int,
+    save_first_render: bool = True,
+    save_first_projection_debug: bool = True,
+) -> dict[str, float]:
+    if not test_views:
+        return {}
+
+    was_training = model.training
+    model.eval()
+
+    l1_values = []
+    psnr_values = []
+    ssim_values = []
+    lpips_values = []
+
+    for index, view in enumerate(test_views):
+        label_image = move_gt_to_device(view, device)
+        pkg = render_original_cuda(
+            model=model,
+            image=view.image,
+            camera=view.camera,
+            bg_color=bg_color,
+            sh_degree=3,
+        )
+        rendered = pkg["render"]
+
+        if rendered.shape != label_image.shape:
+            raise RuntimeError(
+                f"test render shape {tuple(rendered.shape)} does not match label shape {tuple(label_image.shape)}"
+            )
+
+        l1_values.append(F.l1_loss(rendered, label_image).item())
+        metrics = evaluate_image_metrics(
+            rendered=rendered,
+            target=label_image,
+            lpips_evaluator=lpips_evaluator,
+        )
+        psnr_values.append(metrics.psnr)
+        ssim_values.append(metrics.ssim)
+        lpips_values.append(metrics.lpips)
+
+        if save_first_render and index == 1:
+            save_render(
+                rendered,
+                output_root / f"test_render_step_{global_step:06d}_{view.image.name}",
+            )
+
+        if save_first_projection_debug and index == 1:
+            save_gaussian_projection_debug(
+                model=model,
+                image=view.image,
+                camera=view.camera,
+                background=label_image,
+                output_path=output_root / f"test_projection_step_{global_step:06d}_{view.image.name}",
+                point_color=(255, 0, 0),
+                point_radius=1,
+                stride=1,
+            )
+
+    if was_training:
+        model.train()
+
+    return {
+        "l1": float(np.mean(l1_values)),
+        "psnr": float(np.mean(psnr_values)),
+        "ssim": float(np.mean(ssim_values)),
+        "lpips": float(np.mean(lpips_values)),
+    }
+
+
 def main():
     device = torch.device("cuda")
-    dataset_root = Path("src/datasets/SeathruNeRF_dataset/IUI3-RedSea/undistorted_pinhole")
+    dataset_root = Path("src/datasets/SeathruNeRF_dataset/Curasao/undistorted_pinhole")
     sparse_root = dataset_root / "sparse" / "0"
     image_root = dataset_root / "images"
     output_root = Path("outputs/leo_3DGS/train_views")
@@ -152,6 +241,7 @@ def main():
     test_every = 8
     cache_images_on_gpu = True
     save_interval = 1000
+    test_interval = 1000
     densify_from_iter = 500
     densify_until_iter = 9000
     densification_interval = 100
@@ -171,13 +261,16 @@ def main():
         cache_images_on_gpu=cache_images_on_gpu,
     )
     
-    #下面这两行会只训练一张图片
-    train_views = [train_views[0]]
-    test_views = []
+    # #下面这两行会只训练一张图片
+    # train_views = [train_views[0]]
+    # test_views = []
 
     lpips_evaluator = LPIPSEvaluator(net_type="vgg", device=device)
+    lpips_loss_model = LPIPSLoss(net_type="vgg").to(device).eval()   # 训练 loss 用的 LPIPS 模型，和评测用的可以是同一个，也可以不同（比如评测用更大更慢的模型）
+    
     optimizer = create_optimizer(model)
-    bg_color = torch.zeros(3, device=device)
+    # bg_color = torch.zeros(3, device=device)
+    bg_color = torch.tensor([0.1443, 0.1867, 0.2528], device=device)
     densify_state = create_densification_state(model, percent_dense=0.01)
     scene_extent = compute_scene_extent_from_colmap_images([view.image for view in train_views])
 
@@ -210,10 +303,17 @@ def main():
                     f"render shape {tuple(rendered.shape)} does not match label shape {tuple(label_image.shape)}"
                 )
 
-            loss_result = raw_3dgs_loss(
+            # loss_result = raw_3dgs_loss(
+            #     rendered=rendered,
+            #     target=label_image,
+            #     lambda_dssim=0.2,
+            # )
+            loss_result = adjust_raw_3dgs_loss(
                 rendered=rendered,
                 target=label_image,
                 lambda_dssim=0.2,
+                lambda_lpips=0.02,
+                lpips_loss_model=lpips_loss_model,
             )
             loss = loss_result.loss
 
@@ -234,7 +334,7 @@ def main():
                     scene_extent=scene_extent,
                     max_grad=0.0002,
                     min_opacity=0.005,
-                    max_screen_size=None,
+                    max_screen_size=30,
                 )
 
             if global_step % opacity_reset_interval == 0 and global_step <= opacity_reset_until:
@@ -278,6 +378,27 @@ def main():
                     point_radius=1,
                     stride=1,
                 )
+
+            if global_step == 1 or global_step % test_interval == 0:
+                test_metrics = evaluate_test_set(
+                    model=model,
+                    test_views=test_views,
+                    device=device,
+                    bg_color=bg_color,
+                    lpips_evaluator=lpips_evaluator,
+                    output_root=output_root,
+                    global_step=global_step,
+                    save_first_render=True,
+                    save_first_projection_debug=True,
+                )
+                if test_metrics:
+                    print(
+                        f"test step={global_step:06d}, "
+                        f"l1={test_metrics['l1']:.6f}, "
+                        f"psnr={test_metrics['psnr']:.4f}, "
+                        f"ssim={test_metrics['ssim']:.4f}, "
+                        f"lpips={test_metrics['lpips']:.4f}"
+                    )
                             
 if __name__ == "__main__":
     main()
