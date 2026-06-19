@@ -5,7 +5,8 @@ import torch
 @dataclass(frozen=True)
 class GaussianParameters:
     means: torch.Tensor
-    colors: torch.Tensor
+    features_dc: torch.Tensor
+    features_rest: torch.Tensor
     opacity_logits: torch.Tensor
     rotations: torch.Tensor
     log_scales: torch.Tensor
