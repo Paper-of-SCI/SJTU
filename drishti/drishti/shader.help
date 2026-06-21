@@ -1,0 +1,26 @@
+#begin
+ General Help
+Users can control emissive lighting, shadows and reveal options via the Shader Widget.
+#end
+
+#begin
+Emissive
+Emissive is used to apply (OpenGL style) emissive type lighting.  The transfer functions from the last set are used for performing emissive style rendering.
+#end
+
+#begin
+Reveal
+Reveal is useful for revealing regions underneath the top skin/surface. There are 2 Reveal options - Peel and Keep Inside.
+
+Peel is usful for making the front facing surfaces transparent to show the insides more clearly.  It works out the surface facing by surface normals.  If the normals are facing towards the viewer then it will be treated as frontface otherwise backface.  "frontface" and "backface" sliders can be manipulated to modulate the surface transparency.  Users can mix to original surface opacity using "Mix" slider.
+
+Keep Inside works in a very similar fashion to Peel, except only voxels with normals that are within the limits defined by backface and frontface are show.
+#end
+
+#begin
+Shadows
+The effect of shadows is visible when user presses "1".  The key "1" toggles rendering modes between default and user selected.
+
+Shadow contrast controls the darkness of the shadows.
+Shadow blur controls the smoothness of the shadows.
+#end

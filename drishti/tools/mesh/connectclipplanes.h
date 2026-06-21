@@ -1,0 +1,4 @@
+#ifndef CONNECTCLIPPLANES_H
+#define CONNECTCLIPPLANES_H
+
+#endif

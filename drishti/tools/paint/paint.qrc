@@ -1,0 +1,16 @@
+<!DOCTYPE RCC><RCC version="1.0">
+<qresource>
+  <file>images/drishti_paint_32.png</file>
+  <file>images/enlarge.png</file>
+  <file>images/shrink.png</file>
+  <file>images/zoom-in.png</file>
+  <file>images/zoom-out.png</file>
+  <file>images/sizegrip.png</file>
+  <file>crops.help</file>
+  <file>curves.help</file>
+  <file>graphcut.help</file>
+  <file>paint.help</file>
+  <file>viewer.help</file>
+  <file>mesh.help</file>
+</qresource>
+</RCC>

@@ -1,0 +1,290 @@
+#begin
+ General Help
+Users can load surface meshes.  Currently following file formats are recognized -
+Autodesk (.fbx)
+Collada (.dae)
+glTF (.gltf, .glb)
+Blender (.blend)
+3ds Max 3DS (.3ds)
+Wavefront Object (.obj)
+Stanford Polygon Library (.ply)
+Stereolithography (.stl)
+
+Hover over the mesh and press spacebar to bring up the command dialog.
+
+Clip : Enable/Disable clipping via clip planes.
+
+Reveal Transparency [0.1, 1.0] : Transparency of the surface when Reveal is less than 0.0.
+0.1 is low transparency, 1.0 is very high transparency.
+
+Reveal [-1.0, 1.0] : Reveal internal structure.  Default value is 0.0.
+Reveal > 0.0, front facing surface is removed.
+Reveal < 0.0, front and back facing surfaces are made transparent.  Transparency is controlled by Reveal Transparency parameter.
+
+Glow [0.0, 5.0] : Glow the surface
+
+Darken on Glow [0.0, 1.0] : Darken surface when any other surface has glow.  0.0 is do not darken, 1.0 make it desaturated and dark.
+
+Pattern : has three parameters <type> <frequency> <blend>
+Draw pattern on surface.
+<type> is between 0 to 20.  0 is the default value, being no pattern.
+<frequency> is greater than 0.0.  Default value is 10.
+<blend> is the blending fraction (between -2.0 and 1.0) with the original colour of the mesh. <blend> values above 0.0 is replace original color with texture color with 1.0 being completely replace original colour.  <blend> values less than 0.0 modulates only the luminance.
+
+
+Users can reposition/reorient the meshes.
+While translating or rotating the mesh, operation can be restricted to specific axis by pressing x/w/z.  Pressing "w" will make it free to move in any direction.
+
+Mesh can be saved in Stanford Polygon Format to a .ply file.
+
+Press DEL to delete mesh.
+
+--------------------
+Mouse
+--------------------
+Left Mouse drag to translate
+Left Mouse drag + Control Key to rotate
+Left Mouse drag + Control Key + Shift Key to rotate about viewing axis
+
+--------------------
+KeyPress
+--------------------
+Space - opens surface mesh dialog
+DEL - delete surface mesh
+Ctrl+D - duplicate and save surface mesh
+S - save mesh as .ply
+x/y/z - restrict movements to x/y/z
+w - free restrictions on movements
+#end
+
+
+#begin
+save
+save
+
+Save mesh in Stanford Polygon Format (.ply).
+#end
+
+#begin
+colormap
+colormap
+
+Set colors for all meshes to colors obtained from preset color map.
+
+#end
+
+#begin
+lightdir
+lightdir <x><y>
+
+Set light direction for shadowing.  <x> and <y> values are between -1.0 and 1.0.
+
+Default value is 0.1 for both - light direction is slightly from bottom left.
+
+#end
+
+#begin
+glowall
+glowall <val>
+
+Set glow values for all meshes.  Values are in range 0 (no glow) to 5 (waaaaaay overblown for lighter colors).
+If <val> is not specified 0.0 is used.
+
+#end
+
+#begin
+outlineall
+outlineall <val>
+
+Set outline values for all meshes.  Values are in range 0 (no outline) to 1.0 (very thick outline).
+If <val> is not specified 0.0 is used.
+
+#end
+
+#begin
+outline
+outline <val>
+
+Set outline values for meshes that are in outline mode (i.e. whose outline value is greater than 0.0).  Values are in range 0 (no outline) to 1.0 (very thick outline).
+If <val> is not specified 0.0 is used.
+
+#end
+
+#begin
+transparencyall
+transparencyall <val>
+
+Set reveal transparency values for all meshes.  Values are in range 0.1 (very low transparency ) to 1.0 (fully transparent).
+If <val> is not specified 1.0 is used.
+
+#end
+
+#begin
+clipall
+clipall <val>
+
+Set clipping for all meshes.
+0 means do not clip.
+1 means apply clipping.
+
+#end
+
+#begin
+darkenall
+darkenall <val>
+
+Set darken on glow values for all meshes.  Values are in range 0.0 (no darkening) to 1.0 (very dark).
+If <val> is not specified 0.5 is used.
+
+#end
+
+#begin
+mirror
+mirrorx
+mirrory
+mirrorz
+
+Changes the mesh to its mirror image in the relevent axis.
+#end
+
+#begin
+label
+label
+label <fixed/moving/delete>
+
+Attach label to the surface mesh.
+Label dialog will pop up where text, color and font for label can be specified.
+If a hitpoint is available, line is drawn from that point to the label text.
+
+When "fixed" is specified, the label does not change its position on screen.
+When "moving" is specified, the label changes its position on screen along with the mesh it is attached to.
+When "delete" is specified, the attached label is removed.
+
+If no parameter is specified and the mesh does not have a label attached to it, a fixed label is created.
+
+
+Both types of labels - fixed and moving - can be moved around by draging them using left mouse button.
+Select the mesh (via the MeshInformation panel) whose label need to be moved, the drag the label to the desired position.
+
+Label type can be changed.  In the Process Command panel spcify the label command with desired parameter (fixed/moving).
+
+Example :
+label - create a label fixed to screen position if no label present, otherwise maintain the label type.
+label fixed - create a label fixed to screen position
+label moving - create a label that moves with the mesh
+
+#end
+
+
+
+#begin
+resetposition
+resetposition
+
+Reset position to (0,0,0).
+#end
+
+#begin
+resetpositions
+resetpositions
+
+Reset positions of all loaded meshes to (0,0,0).
+#end
+
+#begin
+resetrotation
+resetrotation
+
+Reset rotation.
+#end
+
+#begin
+scale
+scale <scale>
+scale <x y z>
+
+Scale the mesh by factor of <scale> if only one parameter specified, or using 3 parameters x,y,z.
+#end
+
+#begin
+activescale
+activescale <scale>
+
+Scale mesh by factor of <scale> during mouse hover event .  Useful for visual detection of selected mesh.
+#end
+
+#begin
+explode
+explode <rad>
+explodex <rad>
+explodey <rad>
+explodez <rad>
+explodexy <rad>
+explodexz <rad>
+explodeyz <rad>
+
+Move the individual meshes away from centroid of all meshes.
+#end
+
+#begin
+rotate
+rotate x y z a
+
+Rotate by "a" degrees about the axis defined by vector x,y,z. The vector x,y,z is internally normalized.
+
+Example : rotate 0.1 1.0 0.5 40
+#end
+
+#begin
+rotatex
+rotatex a
+
+Rotate by a degrees about X-axis from current rotation.
+
+Example : rotatex 30
+#end
+
+#begin
+rotatey
+rotatey a
+
+Rotate by a degrees about Y-axis from current rotation.
+#end
+
+#begin
+rotatez
+rotatez a
+
+Rotate by a degrees about Z-axis from current rotation.
+#end
+
+
+
+#begin
+keyboard
+Start Keyboard help
+#end
+
+#begin
+DEL
+Delete the mesh.
+#end
+
+#begin
+Ctrl+D
+
+Duplicate the current mesh and save it under different filename.
+#end
+
+
+#begin
+s
+Save the mesh in Stanford Polygon Format to a .ply file.
+#end
+
+#begin
+x/y/z/w
+Constrain translation/rotation of the mesh in x/y/z direction.
+Make it free in all directions with w.
+#end
+

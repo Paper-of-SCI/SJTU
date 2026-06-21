@@ -1,0 +1,82 @@
+#begin
+ General Help
+Mesh Generator.
+
+Adaptivity mesh the scalar volume.
+
+Users can generate water-tight surface mesh using voxel opacities.  Surfaces are coloured using the transfer functions.
+
+Save surface mesh to PLY/OBJ/STL formats.
+
+A colored mesh is saved when PLY option is chosen.
+
+A binary volume is first prepared using voxel opacities, which then is used to generate the surface mesh.  This binary volume has 1 for those voxels that have non-zero opacity and 0 otherwise.  Smoothing can be applied to this volume resulting is smoother surface mesh.  An isosurface value of 0.5 is default, lower values result in dilated surface, whereas, higher values result in eroded surface.
+
+
+Clip/crop/blend/dissect can be applied to the volume before surface mesh generation.
+
+Surfaces are suitable for 3D printing.
+
+
+User can specify how much memory is available for mesh generation.  If not enough memory is available to accommodate all the required data, then the mesh will be generated in several slabs.  These slabs are then joined together to form the complete mesh.
+#end
+
+#begin
+average color
+When generating surface color in the case of "Lut Color", a ray is shot inside the surface to collect color samples along that ray.  These color samples are then combined to generate the surface color.  By default the switch is on - average colour along the ray will be the final colour.  When this switch is off, the colours will be composited in front-to-back manner.  
+#end
+
+#begin
+isosurface value
+In order to generate the surface mesh, first an opacity volume is created by applying transfer function along with the operators crop/clip/blend etc.  This creates a binary volume from voxels that are visible (1) and those that are not (0).  Smoothing can be applied to this volume - smooth opacity parameter defines the degree of smoothing.  An isosurface is then generated from this volume.  Lower isosurface values - closer to 0.0 - result in dilated surface, whereas higher values in an eroded surface.
+
+Default value is 0.5
+#end
+
+#begin
+adaptivity
+The adaptivity threshold determines how closely the isosurface is matched by the resulting mesh.
+Higher thresholds will allow more variation in polygon size, using fewer polygons to express the surface.  Adaptivity values range between 0.0 and 1.0.
+
+Default value is 0.1
+#end
+
+
+#begin
+mesh smoothing
+
+Smooth mesh using Taubin smoothing after the mesh has been generated from opacity volume..
+This is different from smoothing the opacity volume - which is applied before surface generation.
+
+
+Default value is 0 - no smoothing is applied.
+#end
+
+#begin
+depth
+When generating surface color in the case of "Lut Color", a ray is shot inside the surface to collect color samples along that ray.  These color samples are then combined to generate the surface color.  The parameter depth specifies how deep the ray can go.
+
+The ray is always aligned with surface normal.
+
+This ability to shoot ray into the surface gives the user a possibility to texture the surface with the inside structure - it reveals what is beneath the skin.
+
+Default is 2 - just go 2 voxel deep for colour determination.
+#end
+
+
+#begin
+color
+Color for the mesh when using Fixed Color color type option.
+#end
+
+#begin
+color type
+Users can color the mesh surface in a variety of ways - 
+
+Fixed Color
+  Mesh is colored with color selected via the color parameter.
+
+Lut Color
+  Take surface color from original lookup table (i.e. the one used for volume rendering)  based on voxel/voxel opacity value.
+#end
+

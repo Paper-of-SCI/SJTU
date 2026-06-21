@@ -1,0 +1,41 @@
+
+#begin
+General Help
+Mesh Simplify.
+
+Simplify mesh using Quadric Simplification Algorithm by Sven Forstmann.
+
+https://github.com/sp4cerat/Fast-Quadric-Mesh-Simplification
+
+#end
+
+
+#begin
+mesh smoothing
+mesh smoothing
+Controls mesh smoothing before simplification process.
+Higher values result in smoother mesh before simplification.
+#end
+
+#begin
+decimation
+decimation
+Controls amount of decimation for triangles.
+Values are between 0.01 to 0.9.  Lower values means higher decimation.
+Value of 0.2 means decimate 80% of triangles.
+#end
+
+#begin
+aggressive
+aggressive
+Controls better or faster decimation.
+Values are between 1 and 20.  Lower values mean better decimation.  Heigher values mean faster decimation.
+#end
+
+#begin
+color smoothing
+color smoothing
+Controls color smoothing for simplified mesh.
+Higher values result in smoother colors.
+#end
+

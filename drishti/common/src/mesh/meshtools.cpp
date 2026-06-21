@@ -1,0 +1,993 @@
+#include "meshtools.h"
+#include "ply.h"
+
+#include <QList>
+#include <QProgressDialog>
+#include <QMultiMap>
+#include <QApplication>
+#include <QFile>
+#include <QTextStream>
+#include <QtMath>
+#include <QMessageBox>
+#include <QThread>
+
+#include "gmsh.h_cwrap"
+
+
+//------------------------------------------
+//------------------------------------------
+void
+MeshTools::smoothMesh(QVector<QVector3D>& V,
+		      QVector<QVector3D>& N,
+		      QVector<int>& T,
+		      int ntimes,
+		      bool showProgress)
+{  
+  QProgressDialog progress("Mesh smoothing in progress ... ",
+			   QString(),
+			   0, 100,
+			   0,
+			   Qt::WindowStaysOnTopHint);
+  if (showProgress)
+    progress.setMinimumDuration(0);
+  else
+    progress.close();
+  
+  
+  QVector<QVector3D> newV;
+  newV = V;
+  
+  int nv = V.count();
+  
+  //----------------------------
+  // create incidence matrix
+  QMultiMap<int, int> imat;
+  int ntri = T.count()/3;
+  for(int i=0; i<ntri; i++)
+    {
+      if (showProgress)
+	{
+	  if (i%10000 == 0)
+	    {
+	      progress.setValue((int)(100.0*(float)i/(float)(ntri)));
+	      qApp->processEvents();
+	    }
+	}
+
+      int a = T[3*i+0];
+      int b = T[3*i+1];
+      int c = T[3*i+2];
+
+      imat.insert(a, b);
+      imat.insert(b, a);
+      imat.insert(a, c);
+      imat.insert(c, a);
+      imat.insert(b, c);
+      imat.insert(c, b);
+    }
+  //----------------------------
+
+  //----------------------------
+  // smooth vertices
+  if (showProgress)
+    progress.setLabelText("   Smoothing vertices ...");
+  for(int nt=0; nt<ntimes; nt++)
+    {
+      if (showProgress)
+	{
+	  progress.setValue((int)(100.0*(float)nt/(float)(ntimes)));
+	  qApp->processEvents();
+	}
+
+      // deflation step
+      for(int i=0; i<nv; i++)
+	{
+	  QList<int> idx = imat.values(i);
+	  QVector3D v0 = V[i];
+	  QVector3D v = QVector3D(0,0,0);
+	  float sum = 0;
+	  for(int j=0; j<idx.count(); j++)
+	    {
+	      QVector3D vj = V[idx[j]];
+	      float ln = (v0-vj).length();
+	      if (ln > 0)
+		{
+		  sum += 1.0/ln;
+		  v = v + vj/ln;
+		}
+	    }
+	  if (sum > 0)
+	    v0 = v0 + 0.9*(v/sum - v0);
+	  newV[i] = v0;
+	}
+
+      //inflation step
+      for(int i=0; i<nv; i++)
+	{
+	  QList<int> idx = imat.values(i);
+	  QVector3D v0 = newV[i];
+	  QVector3D v = QVector3D(0,0,0);
+	  float sum = 0;
+	  for(int j=0; j<idx.count(); j++)
+	    {
+	      QVector3D vj = newV[idx[j]];
+	      float ln = (v0-vj).length();
+	      if (ln > 0)
+		{
+		  sum += 1.0/ln;
+		  v = v + vj/ln;
+		}
+	    }
+	  if (sum > 0)
+	    v0 = v0 - 0.5*(v/sum - v0);
+
+	  V[i] = v0;
+	}
+    }
+  //----------------------------
+
+
+  //----------------------------
+  if (showProgress)
+    progress.setLabelText("   Calculate normals ...");
+  // now calculate normals
+  for(int i=0; i<nv; i++)
+    newV[i] = QVector3D(0,0,0);
+
+  QVector<int> nvs;
+  nvs.resize(nv);
+  nvs.fill(0);
+
+  for(int i=0; i<ntri; i++)
+    {
+      if (showProgress)
+	{
+	  if (i%10000 == 0)
+	    {
+	      progress.setValue((int)(100.0*(float)i/(float)(ntri)));
+	      qApp->processEvents();
+	    }
+	}
+
+      int a = T[3*i+0];
+      int b = T[3*i+1];
+      int c = T[3*i+2];
+
+      QVector3D va = V[a];
+      QVector3D vb = V[b];
+      QVector3D vc = V[c];
+      QVector3D v0 = (vb-va).normalized();
+      QVector3D v1 = (vc-va).normalized();      
+      QVector3D vn = QVector3D::crossProduct(v1,v0);
+      
+      newV[a] += vn;
+      newV[b] += vn;
+      newV[c] += vn;
+
+      nvs[a]++;
+      nvs[b]++;
+      nvs[c]++;
+    }
+
+  for(int i=0; i<nv; i++)
+      N[i] = newV[i]/nvs[i];
+  //----------------------------
+
+  if (showProgress)
+    progress.setValue(100);
+}
+//------------------------------------------
+//------------------------------------------
+
+
+
+
+//------------------------------------------
+//------------------------------------------
+void
+MeshTools::saveToOBJ(QString objflnm,
+		     QVector<QVector3D> V,
+		     QVector<QVector3D> N,
+		     QVector<int> T,
+		     bool showProgress)
+{		     
+  QVector<QVector3D> C;
+  C.clear();
+  saveToOBJ(objflnm, V, N, C, T, showProgress);
+}
+
+void
+MeshTools::saveToOBJ(QString flnm,
+		     int nSlabs,
+		     int nvertices, int ntriangles)
+{
+  QProgressDialog progress("Saving mesh ...",
+			   QString(),
+			   0, 100,
+			   0,
+			   Qt::WindowStaysOnTopHint);
+
+
+  QVector<QVector3D> V;
+  QVector<QVector3D> N;
+  QVector<QVector3D> C;
+  QVector<int> T;
+
+  for (int nb=0; nb<nSlabs; nb++)
+    {
+      progress.setValue((int)(33.0*(float)nb/(float)nSlabs));
+      qApp->processEvents();
+
+      //-------
+      // read vertices
+      int nverts;
+      QString vflnm = flnm + QString(".%1.vert").arg(nb);
+      QFile vfin(vflnm);
+      vfin.open(QFile::ReadOnly);
+      vfin.read((char*)&nverts, 4);
+      for(int ni=0; ni<nverts; ni++)
+	{
+	  float v[6];
+	  vfin.read((char*)v, 24);
+	  uchar c[3];
+ 	  vfin.read((char*)c, 3);
+
+	  V << QVector3D(v[0], v[1], v[2]);
+	  N << QVector3D(v[3], v[4], v[5]);
+	  C << QVector3D(c[0], c[1], c[2]);
+	}
+      vfin.close();	
+      vfin.remove();
+      //-------
+
+
+      progress.setValue((int)(66.0*(float)nb/(float)nSlabs));
+      qApp->processEvents();
+
+      //-------
+      // read triangles
+      int ntrigs;
+      QString tflnm = flnm + QString(".%1.tri").arg(nb);
+      QFile tfin(tflnm);
+      tfin.open(QFile::ReadOnly);
+      tfin.read((char*)&ntrigs, 4);
+      int *tri;
+      tri = new int[3*ntrigs];
+      tfin.read((char*)tri, 4*3*ntrigs);
+      tfin.close();
+      tfin.remove();
+      
+      for(int ni=0; ni<ntrigs; ni++)
+	T << tri[3*ni+0] << tri[3*ni+1] << tri[3*ni+2];
+
+      delete [] tri;
+      //-------
+
+      progress.setValue((int)(100.0*(float)nb/(float)nSlabs));
+      qApp->processEvents();
+    }
+  progress.setValue(100);
+  qApp->processEvents();
+
+  saveToOBJ(flnm, V, N, C, T);
+}
+
+void
+MeshTools::saveToOBJ(QString objflnm,
+		     QVector<QVector3D> V,
+		     QVector<QVector3D> N,
+		     QVector<QVector3D> C,
+		     QVector<int> T,
+		     bool showProgress)
+{		     
+  QFile fobj(objflnm);
+  fobj.open(QFile::WriteOnly);
+  QTextStream out(&fobj);
+  out << "#\n";
+  out << "#  Wavefront OBJ generated by Drishti\n";
+  out << "#\n";
+  out << "#  https://github.com/nci/drishti\n";
+  out << "#\n";
+  out << QString("# %1 vertices\n").arg(V.count());
+  if (N.count() > 0)
+    out << QString("# %1 normals\n").arg(N.count());
+  out << QString("# %1 triangles\n").arg(T.count()/3);
+
+  out << "g\n";
+  if (C.count() == 0)
+    {
+      for(int i=0; i<V.count(); i++)
+	out << "v " << QString("%1 %2 %3\n").arg(V[i].x()).arg(V[i].y()).arg(V[i].z());
+    }
+  else
+    {
+      for(int i=0; i<V.count(); i++)
+	out << "v " << QString("%1 %2 %3  %4 %5 %6\n").arg(V[i].x()).arg(V[i].y()).arg(V[i].z()).\
+	                                               arg(C[i].x()/255.0).arg(C[i].y()/255.0).arg(C[i].z()/255.0);
+    }
+
+  if (N.count() > 0)
+    {
+      out << "g\n";
+      for(int i=0; i<N.count(); i++)
+	out << "vn "<< QString("%1 %2 %3\n").arg(N[i].x()).arg(N[i].y()).arg(N[i].z());
+    }
+
+  if (N.count() > 0) // with normal and no texcoord
+    {      
+      out << "g\n";
+      for(int i=0; i<T.count()/3; i++)
+	out << "f " << QString("%1//%1 %2//%2 %3//%3\n").arg(T[3*i+2]+1).arg(T[3*i+1]+1).arg(T[3*i+0]+1);
+    }
+  else // no normals and no texcoord
+    {      
+      out << "g\n";
+      for(int i=0; i<T.count()/3; i++)
+	out << "f " << QString("%1 %2 %3\n").arg(T[3*i+2]+1).arg(T[3*i+1]+1).arg(T[3*i+0]+1);
+    }
+}
+//------------------------------------------
+//------------------------------------------
+
+
+
+
+
+//------------------------------------------
+//------------------------------------------
+void
+MeshTools::saveToPLY(QString flnm,
+		     QVector<QVector3D> V,
+		     QVector<QVector3D> N,
+		     QVector<int> T,
+		     bool showProgress)
+{
+  QVector<QVector3D> C;
+  C.clear();
+  saveToPLY(flnm, V, N, C, T, showProgress); 
+}
+void
+MeshTools::saveToPLY(QString flnm,
+		     int nSlabs,
+		     int nvertices, int ntriangles,
+		     bool bin)
+{
+  QProgressDialog progress("Saving mesh ...",
+			   QString(),
+			   0, 100,
+			   0,
+			   Qt::WindowStaysOnTopHint);
+
+
+  QVector<QVector3D> V;
+  QVector<QVector3D> N;
+  QVector<QVector3D> C;
+  QVector<int> T;
+
+  for (int nb=0; nb<nSlabs; nb++)
+    {
+      progress.setValue((int)(33.0*(float)nb/(float)nSlabs));
+      qApp->processEvents();
+
+      //-------
+      // read vertices
+      int nverts;
+      QString vflnm = flnm + QString(".%1.vert").arg(nb);
+      QFile vfin(vflnm);
+      vfin.open(QFile::ReadOnly);
+      vfin.read((char*)&nverts, 4);
+      for(int ni=0; ni<nverts; ni++)
+	{
+	  float v[6];
+	  vfin.read((char*)v, 24);
+	  uchar c[3];
+ 	  vfin.read((char*)c, 3);
+
+	  V << QVector3D(v[0], v[1], v[2]);
+	  N << QVector3D(v[3], v[4], v[5]);
+	  C << QVector3D(c[0], c[1], c[2]);
+	}
+      vfin.close();	
+      vfin.remove();
+      //-------
+
+      progress.setValue((int)(66.0*(float)nb/(float)nSlabs));
+      qApp->processEvents();
+
+      //-------
+      // read triangles
+      int ntrigs;
+      QString tflnm = flnm + QString(".%1.tri").arg(nb);
+      QFile tfin(tflnm);
+      tfin.open(QFile::ReadOnly);
+      tfin.read((char*)&ntrigs, 4);
+      int *tri;
+      tri = new int[3*ntrigs];
+      tfin.read((char*)tri, 4*3*ntrigs);
+      tfin.close();
+      tfin.remove();
+      
+      for(int ni=0; ni<ntrigs; ni++)
+	T << tri[3*ni+0] << tri[3*ni+1] << tri[3*ni+2];
+
+      delete [] tri;
+      //-------
+
+      progress.setValue((int)(100.0*(float)nb/(float)nSlabs));
+      qApp->processEvents();
+    }
+  progress.setValue(100);
+  qApp->processEvents();
+
+
+  saveToPLY(flnm, V, N, C, T);
+}
+
+void
+MeshTools::saveToPLY(QString flnm,
+		     QVector<QVector3D> V,
+		     QVector<QVector3D> N,
+		     QVector<QVector3D> C,
+		     QVector<int> T,
+		     bool showProgress)
+{
+  QProgressDialog progress("Saving mesh ...",
+			   QString(),
+			   0, 100,
+			   0,
+			   Qt::WindowStaysOnTopHint);
+  if (showProgress)
+    progress.setMinimumDuration(0);
+  else
+    progress.close();
+
+  
+  QStringList ps;
+  ps << "x";
+  ps << "y";
+  ps << "z";
+  ps << "nx";
+  ps << "ny";
+  ps << "nz";
+  ps << "red";
+  ps << "green";
+  ps << "blue";
+  ps << "vertex_indices";
+  ps << "vertex";
+  ps << "face";
+
+  QList<char *> plyStrings;
+  for(int i=0; i<ps.count(); i++)
+    {
+      char *s;
+      s = new char[ps[i].size()+1];
+      strcpy(s, ps[i].toLatin1().data());
+      plyStrings << s;
+    }
+
+
+  int ntriangles = T.count()/3;
+  int nvertices = V.count();
+
+  typedef struct PlyFace
+  {
+    unsigned char nverts;    /* number of Vertex indices in list */
+    int *verts;              /* Vertex index list */
+  } PlyFace;
+
+  typedef struct
+  {
+    float  x,  y,  z ;  /**< Vertex coordinates */
+    float nx, ny, nz ;  /**< Vertex normal */
+    uchar r, g, b;
+  } myVertex ;
+
+  PlyProperty vert_props[] = { /* list of property information for a vertex */
+    {plyStrings[0], Float32, Float32, offsetof(myVertex,x), 0, 0, 0, 0},
+    {plyStrings[1], Float32, Float32, offsetof(myVertex,y), 0, 0, 0, 0},
+    {plyStrings[2], Float32, Float32, offsetof(myVertex,z), 0, 0, 0, 0},
+    {plyStrings[3], Float32, Float32, offsetof(myVertex,nx), 0, 0, 0, 0},
+    {plyStrings[4], Float32, Float32, offsetof(myVertex,ny), 0, 0, 0, 0},
+    {plyStrings[5], Float32, Float32, offsetof(myVertex,nz), 0, 0, 0, 0},
+    {plyStrings[6], Uint8, Uint8, offsetof(myVertex,r), 0, 0, 0, 0},
+    {plyStrings[7], Uint8, Uint8, offsetof(myVertex,g), 0, 0, 0, 0},
+    {plyStrings[8], Uint8, Uint8, offsetof(myVertex,b), 0, 0, 0, 0},
+  };
+
+  PlyProperty face_props[] = { /* list of property information for a face */
+    {plyStrings[9], Int32, Int32, offsetof(PlyFace,verts),
+     1, Uint8, Uint8, offsetof(PlyFace,nverts)},
+  };
+
+  PlyFile    *ply;
+  FILE       *fp = fopen(flnm.toLatin1().data(),
+			 bin ? "wb" : "w");
+
+  PlyFace     face ;
+  int         verts[3] ;
+  char       *elem_names[]  = {plyStrings[10], plyStrings[11]};
+  ply = write_ply (fp,
+		   2,
+		   elem_names,
+		   bin? PLY_BINARY_LE : PLY_ASCII );
+
+  /* describe what properties go into the PlyVertex elements */
+  describe_element_ply ( ply, plyStrings[10], nvertices );
+  describe_property_ply ( ply, &vert_props[0] );
+  describe_property_ply ( ply, &vert_props[1] );
+  describe_property_ply ( ply, &vert_props[2] );
+  describe_property_ply ( ply, &vert_props[3] );
+  describe_property_ply ( ply, &vert_props[4] );
+  describe_property_ply ( ply, &vert_props[5] );
+  describe_property_ply ( ply, &vert_props[6] );
+  describe_property_ply ( ply, &vert_props[7] );
+  describe_property_ply ( ply, &vert_props[8] );
+
+  /* describe PlyFace properties (just list of PlyVertex indices) */
+  describe_element_ply ( ply, plyStrings[11], ntriangles );
+  describe_property_ply ( ply, &face_props[0] );
+
+  header_complete_ply ( ply );
+
+
+  /* set up and write the PlyVertex elements */
+  put_element_setup_ply ( ply, plyStrings[10] );
+
+  for(int ni=0; ni<nvertices; ni++)
+    {
+      if (showProgress)
+	{
+	  if (ni%10000 == 0)
+	    {
+	      progress.setValue((int)(100.0*(float)ni/(float)(nvertices)));
+	      qApp->processEvents();
+	    }
+	}
+
+      myVertex vertex;
+      vertex.x = V[ni].x();
+      vertex.y = V[ni].y();
+      vertex.z = V[ni].z();
+      vertex.nx = N[ni].x();
+      vertex.ny = N[ni].y();
+      vertex.nz = N[ni].z();
+      if (C.count() > 0)
+	{
+	  vertex.r = C[ni].x();
+	  vertex.g = C[ni].y();
+	  vertex.b = C[ni].z();
+	}
+      else
+	{
+	  vertex.r = vertex.g = vertex.b = 200;
+	}
+
+      put_element_ply ( ply, ( void * ) &vertex );
+    }
+
+  /* set up and write the PlyFace elements */
+  put_element_setup_ply ( ply, plyStrings[11] );
+  face.nverts = 3 ;
+  face.verts  = verts ;
+  for(int ni=0; ni<ntriangles; ni++)
+    {      
+      face.verts[0] = T[3*ni+2];
+      face.verts[1] = T[3*ni+1];
+      face.verts[2] = T[3*ni+0];
+      
+      put_element_ply ( ply, ( void * ) &face );
+    }
+
+  close_ply ( ply );
+  free_ply ( ply );
+
+  for(int i=0; i<plyStrings.count(); i++)
+    delete [] plyStrings[i];
+
+  if (showProgress)
+    progress.setValue(100);
+}
+//------------------------------------------
+//------------------------------------------
+
+
+
+
+
+//------------------------------------------
+//------------------------------------------
+void
+MeshTools::saveToSTL(QString flnm,
+		     int nSlabs,
+		     int nvertices, int ntriangles)
+{
+  QProgressDialog progress("Saving mesh ...",
+			   QString(),
+			   0, 100,
+			   0,
+			   Qt::WindowStaysOnTopHint);
+
+  QVector<QVector3D> V;
+  QVector<QVector3D> N;
+  QVector<int> T;
+
+  for (int nb=0; nb<nSlabs; nb++)
+    {
+      progress.setValue((int)(33.0*(float)nb/(float)nSlabs));
+      qApp->processEvents();
+
+      //-------
+      // read vertices
+      int nverts;
+      QString vflnm = flnm + QString(".%1.vert").arg(nb);
+      QFile vfin(vflnm);
+      vfin.open(QFile::ReadOnly);
+      vfin.read((char*)&nverts, 4);
+      float *v;
+      v = new float[6*nverts];
+      vfin.read((char*)v, 4*6*nverts);
+      vfin.close();	
+      vfin.remove();
+      for(int ni=0; ni<nverts; ni++)
+	{
+	  V << QVector3D(v[6*ni+0], v[6*ni+1], v[6*ni+2]);
+	  N << QVector3D(v[6*ni+3], v[6*ni+4], v[6*ni+5]);
+	}
+      delete [] v;
+      //-------
+
+      progress.setValue((int)(66.0*(float)nb/(float)nSlabs));
+      qApp->processEvents();
+
+      //-------
+      // read triangles
+      int ntrigs;
+      QString tflnm = flnm + QString(".%1.tri").arg(nb);
+      QFile tfin(tflnm);
+      tfin.open(QFile::ReadOnly);
+      tfin.read((char*)&ntrigs, 4);
+      int *tri;
+      tri = new int[3*ntrigs];
+      tfin.read((char*)tri, 4*3*ntrigs);
+      tfin.close();
+      tfin.remove();
+
+      for(int ni=0; ni<ntrigs; ni++)
+	T << tri[3*ni+0] << tri[3*ni+1] << tri[3*ni+2];
+
+      delete [] tri;
+      //-------
+
+      progress.setValue((int)(100.0*(float)nb/(float)nSlabs));
+      qApp->processEvents();
+    }
+  progress.setValue(100);
+  qApp->processEvents();
+
+
+  saveToSTL(flnm, V, N, T);
+}
+
+void
+MeshTools::saveToSTL(QString flnm,
+		     QVector<QVector3D> V,
+		     QVector<QVector3D> N,
+		     QVector<int> T,
+		     bool showProgress)
+{
+  QProgressDialog progress("Saving mesh ...",
+			   QString(),
+			   0, 100,
+			   0,
+			   Qt::WindowStaysOnTopHint);
+  if (showProgress)
+    progress.setMinimumDuration(0);
+  else
+    progress.close();
+
+  
+  int ntri = T.count()/3;
+  
+  char header[80];
+  sprintf(header, "Drishti generated STL file.");
+  QFile fstl(flnm);
+  fstl.open(QFile::WriteOnly);
+  fstl.write((char*)&header, 80); // 80 byte header
+  fstl.write((char*)&ntri, 4); // number of triangles
+
+  for(int ni=0; ni<ntri; ni++)
+    {
+      if (showProgress)
+	{
+	  if (ni%10000 == 0)
+	    {
+	      progress.setValue((int)(100.0*(float)ni/(float)(ntri)));
+	      qApp->processEvents();
+	    }
+	}
+
+      float v[12];
+      int k = T[3*ni+0];
+      int j = T[3*ni+1];
+      int i = T[3*ni+2];
+
+      if (N.count() == 0)
+	{
+	  v[0] = v[1] = v[2] = 0;
+	}
+      else
+	{
+	  v[0] = N[i].x() + N[j].x() + N[k].x();
+	  v[1] = N[i].y() + N[j].y() + N[k].y();
+	  v[2] = N[i].z() + N[j].z() + N[k].z();
+	  float mag = qSqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
+	  v[0]/=mag;
+	  v[1]/=mag;
+	  v[2]/=mag;
+	  v[0] = -v[0];
+	  v[1] = -v[1];
+	  v[2] = -v[2];
+	}
+      
+      v[3] = V[i].x();
+      v[4] = V[i].y();
+      v[5] = V[i].z();
+      
+      v[6] = V[j].x();
+      v[7] = V[j].y();
+      v[8] = V[j].z();
+      
+      v[9] = V[k].x();
+      v[10]= V[k].y();
+      v[11]= V[k].z();
+      
+      fstl.write((char*)&v, 12*4);
+      
+      ushort abc = 0; // attribute byte count
+      fstl.write((char*)&abc, 2);
+    }
+
+  fstl.close();
+
+  if (showProgress)
+    progress.setValue(100);
+}
+//------------------------------------------
+//------------------------------------------
+
+
+
+
+
+//------------------------------------------
+//------------------------------------------
+bool
+MeshTools::saveToTetrahedralMesh(QString flnm,
+				 int nSlabs,
+				 int nvertices, int ntriangles)
+{
+  QProgressDialog progress("Saving tetrahedral mesh ...",
+			   QString(),
+			   0, 100,
+			   0,
+			   Qt::WindowStaysOnTopHint);
+  progress.setMinimumDuration(0);
+
+  QVector<QVector3D> V;
+  QVector<int> T;  
+
+  for (int nb=0; nb<nSlabs; nb++)
+    {
+      progress.setValue((int)(33.0*(float)nb/(float)nSlabs));
+      qApp->processEvents();
+
+      //-------
+      // read vertices
+      int nverts;
+      QString vflnm = flnm + QString(".%1.vert").arg(nb);
+      QFile vfin(vflnm);
+      vfin.open(QFile::ReadOnly);
+      vfin.read((char*)&nverts, 4);
+      for(int ni=0; ni<nverts; ni++)
+	{
+	  float v[6];
+	  vfin.read((char*)v, 24);
+	  uchar c[3];
+ 	  vfin.read((char*)c, 3);
+
+	  V << QVector3D(v[0], v[1], v[2]);
+	}
+      vfin.close();	
+      vfin.remove();
+      //-------
+
+      progress.setValue((int)(66.0*(float)nb/(float)nSlabs));
+      qApp->processEvents();
+
+      //-------
+      // read triangles
+      int ntrigs;
+      QString tflnm = flnm + QString(".%1.tri").arg(nb);
+      QFile tfin(tflnm);
+      tfin.open(QFile::ReadOnly);
+      tfin.read((char*)&ntrigs, 4);
+      int *tri;
+      tri = new int[3*ntrigs];
+      tfin.read((char*)tri, 4*3*ntrigs);
+      tfin.close();
+      tfin.remove();
+      
+      for(int ni=0; ni<ntrigs; ni++)
+	T << tri[3*ni+0] << tri[3*ni+1] << tri[3*ni+2];
+
+      delete [] tri;
+      //-------
+
+      progress.setValue((int)(100.0*(float)nb/(float)nSlabs));
+      qApp->processEvents();
+    }
+  progress.setValue(100);
+  qApp->processEvents();
+
+
+  return saveToTetrahedralMesh(flnm, V, T);
+}
+
+bool
+MeshTools::saveToTetrahedralMesh(QString flnm,
+				 QVector<QVector3D> V,
+				 QVector<int> T,
+				 bool showProgress)
+{
+  QProgressDialog progress("Saving tetrahedral mesh ...",
+			   QString(),
+			   0, 100,
+			   0,
+			   Qt::WindowStaysOnTopHint);
+  progress.setMinimumDuration(0);
+
+  //QMessageBox::information(0, "", QString("Using gmsh %1").arg(GMSH_API_VERSION));
+  gmsh::initialize();
+
+// Set Gmsh options
+  int nThreads = qMax(1, (int)(QThread::idealThreadCount()));
+  gmsh::option::setNumber("General.NumThreads", nThreads);   // multithreading
+  //gmsh::option::setNumber("Mesh.Algorithm3D", 1); // Delaunay for 3D
+  gmsh::option::setNumber("Mesh.Algorithm3D", 10); // HXT for 3D
+  gmsh::option::setNumber("Mesh.Optimize", 1);    // Optimize mesh
+  //gmsh::option::setNumber("Mesh.OptimizeNetgen", 1); // Use Netgen for optimization
+
+  try
+      {
+//-----------------------------------------
+// Save STL and load from it
+      QString stl_flnm = flnm.chopped(3)+"stl";
+      QVector<QVector3D> N;
+      saveToSTL(stl_flnm, V, N, T);
+  
+      gmsh::model::add("tetrahedral_model");
+	gmsh::merge(stl_flnm.toLatin1().data());
+	//QMessageBox::information(0, "", "merge "+stl_flnm);
+	
+	// Create a volume from all the surfaces
+	gmsh::vectorpair s;
+	gmsh::model::getEntities(s, 2);
+	std::vector<int> sl;
+	for(auto surf : s) sl.push_back(surf.second);
+	int l = gmsh::model::geo::addSurfaceLoop(sl);
+	gmsh::model::geo::addVolume({l});
+      QFile f(stl_flnm);
+      f.remove(); // remove temporary stl file
+//-----------------------------------------
+
+	
+////-----------------------------------------
+//        gmsh::model::add("tetrahedral_model");
+//
+//	//--------------
+//	// Add vertices to Gmsh
+//	progress.setLabelText("Adding points");
+//	std::vector<int> vertexTags;
+//	for (int i = 0; i < V.count(); ++i)
+//	  {
+//	    int tag = gmsh::model::geo::addPoint(V[i].x(), V[i].y(), V[i].z());
+//	    vertexTags.push_back(tag);
+//	  }
+//	//--------------
+//
+//	progress.setValue(20);
+//	qApp->processEvents();
+//	
+//	//--------------
+//	// Add triangles to Gmsh
+//	progress.setLabelText("Adding triangles");
+//	std::vector<int> curveLoops;
+//	std::vector<int> surfaceTags;
+//        
+//	for (int i = 0; i < T.count()/3; ++i)
+//	  {
+//	    // Create lines for each edge of the triangle
+//	    int line1 = gmsh::model::geo::addLine(vertexTags[T[3*i+0]], 
+//						  vertexTags[T[3*i+2]]);
+//	    int line2 = gmsh::model::geo::addLine(vertexTags[T[3*i+2]], 
+//						  vertexTags[T[3*i+1]] );
+//	    int line3 = gmsh::model::geo::addLine(vertexTags[T[3*i+1]], 
+//						  vertexTags[T[3*i+0]] );
+//	    
+//	    // Create curve loop from the lines
+//	    int curveLoop = gmsh::model::geo::addCurveLoop({line1, line2, line3});
+//	    curveLoops.push_back(curveLoop);
+//            
+//	    // Create surface from the curve loop
+//	    int surface = gmsh::model::geo::addPlaneSurface({curveLoop});
+//	    surfaceTags.push_back(surface);
+//	  }
+//	//--------------
+//
+//	progress.setValue(40);
+//	qApp->processEvents();
+//		
+//	progress.setLabelText("Create surface loop and volume");
+//	//--------------
+//	// Create surface loop from all surfaces
+//	int surfaceLoop = gmsh::model::geo::addSurfaceLoop(surfaceTags);
+//	//--------------
+//        
+//	//--------------
+//	// Create volume from surface loop
+//	gmsh::model::geo::addVolume({surfaceLoop});
+//	//--------------
+////-----------------------------------------
+
+	
+	progress.setValue(60);
+	qApp->processEvents();
+	
+	progress.setLabelText("Sync");
+	//--------------
+	// Synchronize the geometry
+        gmsh::model::geo::synchronize();
+	//--------------
+
+	progress.setValue(80);
+	qApp->processEvents();
+
+	progress.setLabelText("Creating tetrahedral mesh");
+	//--------------
+        // Generate 3D mesh (tetrahedral)
+        gmsh::model::mesh::generate(3);
+	//--------------
+
+	
+//	// Optimize the mesh
+//	QMessageBox::information(0, "", "optimizing tetrahedral mesh");
+//      gmsh::model::mesh::optimize("Netgen");
+
+
+	progress.setValue(90);
+	qApp->processEvents();
+
+	progress.setLabelText("Saving tetrahedral mesh");
+	//--------------
+	// Save the mesh to a file
+	gmsh::write(flnm.toLatin1().data());
+	//--------------
+
+	// Finalize Gmsh
+	gmsh::finalize();
+	progress.setValue(100);
+      }
+    catch (const std::exception &e)
+      {
+	// Finalize Gmsh
+	gmsh::finalize();
+	progress.setValue(100);
+	QMessageBox::information(0, "Error", e.what());
+
+	return false;
+      }
+
+  return true;
+}
+//------------------------------------------
+//------------------------------------------
