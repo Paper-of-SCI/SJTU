@@ -85,6 +85,9 @@ from torch import Tensor
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+LOSS_DIR = Path(__file__).resolve().parent / "loss"
+if str(LOSS_DIR) not in sys.path:
+    sys.path.insert(0, str(LOSS_DIR))
 
 DEFAULT_DENSIFY_STOP_STEP = 15_000
 DEFAULT_DENSIFY_GRAD_THRESHOLD = 2.0e-6
@@ -114,7 +117,7 @@ from modules import (
     uses_semantic_importance,
     validate_semantic_importance_root,
 )
-from methods.semantic_importance import SemanticImportanceProvider
+from lpipsLoss import LPIPSLoss
 from utils.dataset_loaders import load_colmap_dataset
 from utils.image_utils import compute_psnr, save_image
 from utils.ply_io import gaussians_to_ply_dict, write_ply
@@ -129,7 +132,7 @@ def parse_args() -> argparse.Namespace:
     # --data 指向单个 COLMAP scene；--out 每次实验都建议用新目录，避免覆盖旧结果。
     parser.add_argument(
         "--data", 
-        default="src/datasets/SeathruNeRF_dataset/Curasao", 
+        default="src/datasets/SeathruNeRF_dataset/Curasao/undistorted_pinhole", 
         help="COLMAP scene directory."
     )
     parser.add_argument(
@@ -197,6 +200,18 @@ def parse_args() -> argparse.Namespace:
         default=0.2, 
         help="Photometric DSSIM weight."
     )
+    parser.add_argument(
+        "--lambda-lpips",
+        type=float,
+        default=0.0,
+        help="Train-time LPIPS perceptual loss weight; 0 disables LPIPS loss.",
+    )
+    parser.add_argument(
+        "--lpips-start-step",
+        type=int,
+        default=3000,
+        help="First training step that includes LPIPS loss when --lambda-lpips > 0.",
+    )
 
     # 训练过程输出：
     # --save-every 控制 preview PNG 和 checkpoint PLY；
@@ -242,7 +257,7 @@ def parse_args() -> argparse.Namespace:
     # eval LPIPS 只用于 held-out evaluation，不参与训练反传。
     # 如果只想快速验证训练链路，可以不加 --eval-lpips，避免额外模型加载和耗时。
     parser.add_argument("--eval-lpips", action="store_false", help="Compute LPIPS during held-out training evaluation.")
-    parser.add_argument("--lpips-net", default="vgg", choices=["alex", "vgg", "squeeze"], help="LPIPS backbone used when --eval-lpips is enabled.")
+    parser.add_argument("--lpips-net", default="vgg", choices=["alex", "vgg", "squeeze"], help="LPIPS backbone used for train-time LPIPS loss and held-out LPIPS evaluation.")
     parser.add_argument(
         "--lpips-backend",
         default="lpips",
@@ -262,6 +277,10 @@ def main() -> None:
     # 5. 保存 checkpoint 和 summary。
     args = parse_args()
     args.densification_mode = normalize_densification_mode(args.densification_mode)
+    if args.lambda_lpips < 0.0:
+        raise ValueError(f"lambda_lpips must be >= 0, got {args.lambda_lpips}")
+    if args.lpips_start_step < 0:
+        raise ValueError(f"lpips_start_step must be >= 0, got {args.lpips_start_step}")
     
     if not torch.cuda.is_available():
         raise RuntimeError("没发现cuda设备，请检查CUDA安装和环境配置。")
@@ -356,6 +375,8 @@ def main() -> None:
     train_cameras = build_cameras(scene, device)
     test_cameras = build_cameras(test_scene, device)
  
+    lpips_loss_enabled = bool(args.lambda_lpips > 0.0)
+    lpips_loss_model = LPIPSLoss(net=args.lpips_net).to(device).eval() if lpips_loss_enabled else None
 
     # best_tracker 只在 eval_every > 0 时启用。它会跟踪 PSNR/SSIM 最大值；
     # 如果 --eval-lpips 开启，也会跟踪 LPIPS 最小值。
@@ -392,6 +413,10 @@ def main() -> None:
         ("patch_size", str(args.patch_size)),
         ("edge_weight", f"{args.patch_edge_weight:g}"),
         ("detail_lambda", f"{args.patch_detail_lambda:g}"),
+        ("lambda_lpips", f"{args.lambda_lpips:g}"),
+        ("lpips_start_step", str(args.lpips_start_step)),
+        ("lpips_loss_enabled", str(lpips_loss_enabled)),
+        ("lpips_loss_net", args.lpips_net if lpips_loss_enabled else ""),
         ("heldout_eval_every", str(args.eval_every)),
         ("eval_lpips", str(eval_lpips_enabled)),
         ("lpips_backend", args.lpips_backend if eval_lpips_enabled else ""),
@@ -410,6 +435,7 @@ def main() -> None:
         "loss": "-",
         "l1": "-",
         "ssim": "-",
+        "train_lpips": "-",
         "train_psnr": "-",
         "gaussians": str(model.num_gaussians),
         "step_time": "-",
@@ -459,9 +485,16 @@ def main() -> None:
             
             
 
-            # 图像监督：渲染图和 GT 图计算 L1 + DSSIM。
+            # 图像监督：渲染图和 GT 图计算 L1 + DSSIM，可选后期叠加 LPIPS perceptual loss。
             # clamp 只约束送入 loss 的 RGB 范围，避免异常值扩大损失；GT 已在 loader 中归一化到 [0, 1]。
-            loss, parts = photometric_loss(render.image.clamp(0.0, 1.0), gt_image, lambda_dssim=args.lambda_dssim)
+            render_for_loss = render.image.clamp(0.0, 1.0)
+            loss, parts = photometric_loss(render_for_loss, gt_image, lambda_dssim=args.lambda_dssim)
+            lpips_value = render_for_loss.new_zeros(())
+            if lpips_loss_model is not None and step >= args.lpips_start_step:
+                lpips_value = lpips_loss_model(render_for_loss, gt_image)
+                loss = loss + float(args.lambda_lpips) * lpips_value
+            parts["lpips"] = lpips_value
+            parts["total"] = loss
 
             # 反向传播会把图像误差传回 Gaussian 参数，然后 Adam 更新这些参数。
             # 注意 densification 用的是本轮 backward 后累积到 means2d 的屏幕空间梯度。
@@ -482,6 +515,7 @@ def main() -> None:
                     "loss": f"{float(loss.detach()):.4f}",
                     "l1": f"{float(parts['l1'].detach()):.5f}",
                     "ssim": f"{float(parts['ssim'].detach()):.4f}",
+                    "train_lpips": f"{float(parts['lpips'].detach()):.5f}" if lpips_loss_enabled else "-",
                     "gaussians": str(model.num_gaussians),
                     "step_time": f"{step_elapsed:.2f}s",
                     "camera": Path(camera.image_path).name,
@@ -504,10 +538,11 @@ def main() -> None:
                         gt_image.detach().permute(1, 2, 0).cpu().numpy(),
                     )
                 dashboard_state["train_psnr"] = f"{psnr:.2f}"
+                lpips_text = f" LPIPS={float(parts['lpips'].detach()):.4f}" if lpips_loss_enabled else ""
                 live.console.log(
                     f"训练 | step={step:06d} loss={float(loss.detach()):.6f} "
                     f"L1={float(parts['l1'].detach()):.6f} SSIM={float(parts['ssim'].detach()):.4f} "
-                    f"PSNR={psnr:.2f} Gaussian={model.num_gaussians} "
+                    f"PSNR={psnr:.2f}{lpips_text} Gaussian={model.num_gaussians} "
                     f"densify={dashboard_state['densification']}"
                 )
 
@@ -639,6 +674,10 @@ def save_training_summary(
         "eval_lpips": bool(args.eval_lpips and args.eval_every > 0),
         "lpips_net": str(args.lpips_net) if args.eval_lpips and args.eval_every > 0 else "",
         "lpips_backend": str(args.lpips_backend) if args.eval_lpips and args.eval_every > 0 else "",
+        "lambda_lpips": float(args.lambda_lpips),
+        "lpips_start_step": int(args.lpips_start_step),
+        "lpips_loss_enabled": bool(args.lambda_lpips > 0.0),
+        "lpips_loss_net": str(args.lpips_net) if args.lambda_lpips > 0.0 else "",
         "densify_grad_threshold": float(args.densify_grad_threshold),
         "densify_start_step": int(args.densify_start_step),
         "densify_stop_step": int(args.densify_stop_step),
@@ -690,6 +729,7 @@ def render_training_dashboard(progress: Progress, state: dict[str, str]) -> Pane
         ("loss", "loss"),
         ("l1", "L1"),
         ("ssim", "SSIM"),
+        ("train_lpips", "训练 LPIPS"),
         ("train_psnr", "训练 PSNR"),
         ("gaussians", "Gaussian"),
         ("step_time", "单步耗时"),
