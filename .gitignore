@@ -1,3 +1,48 @@
 __pycache__/
 *.py[cod]
 *$py.class
+
+# Python build/test artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Virtual environments and local package caches
+.venv/
+venv/
+env/
+.env/
+conda-meta/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local secrets/config
+.env
+.env.*
+!.env.example
+
+# Editors and OS files
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
+
+# Windows files copied into WSL
+*:Zone.Identifier
+
+# Local experiment outputs
+outputs/
+runs/
+logs/
+wandb/
+checkpoints/
+
+# VS Code per-user workspace settings
+.vscode/

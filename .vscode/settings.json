@@ -1,8 +1,0 @@
-{
-  "files.exclude": {
-    "**/*:Zone.Identifier": true
-  },
-  "search.exclude": {
-    "**/*:Zone.Identifier": true
-  }
-}
