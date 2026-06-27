@@ -1,6 +1,6 @@
-src/datasets/
-!src/datasets/
-!src/datasets/readme.md
+/src/datasets/**
+!/src/datasets/
+!/src/datasets/readme.md
 
 # OS/editor junk
 .DS_Store
@@ -19,10 +19,10 @@ __pycache__/
 outputs/
 runs/
 wandb/
-**/results/
-**/ckpts/
-**/checkpoints/
-**/logs/
+**/results/**
+**/ckpts/**
+**/checkpoints/**
+**/logs/**
 
 # Local CUDA/PyTorch build and wheel artifacts
 methods/**/.cuda-*/
