@@ -11,10 +11,15 @@
 
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
 #include <iostream>
 #include <vector>
 #include "rasterizer.h"
 #include <cuda_runtime_api.h>
+
+using std::uint32_t;
+using std::uint64_t;
 
 namespace CudaRasterizer
 {

@@ -76,7 +76,7 @@ class LPIPSLoss(nn.Module):
         if version != "0.1":
             raise ValueError("only LPIPS version 0.1 is supported")
 
-        from methods.seasplat.lpipsPyTorch.modules.networks import LinLayers, get_network
+        from methods.seasplat_Render.lpipsPyTorch.modules.networks import LinLayers, get_network
 
         self.net_type = net_type
         self.version = version

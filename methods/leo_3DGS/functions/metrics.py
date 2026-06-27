@@ -162,7 +162,7 @@ class _LocalLPIPS(nn.Module):
         if version != "0.1":
             raise ValueError("only LPIPS version 0.1 is supported")
 
-        from methods.seasplat.lpipsPyTorch.modules.networks import LinLayers, get_network
+        from methods.seasplat_Render.lpipsPyTorch.modules.networks import LinLayers, get_network
 
         self.net = get_network(net_type)
         self.lin = LinLayers(self.net.n_channels_list)

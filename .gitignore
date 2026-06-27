@@ -2,29 +2,61 @@ src/datasets/
 !src/datasets/
 !src/datasets/readme.md
 
+# OS/editor junk
+.DS_Store
+.vscode/*.log
+
 # Python cache files
 __pycache__/
 *.py[cod]
 *$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
 
 # Local training/evaluation outputs
 outputs/
 runs/
 wandb/
+**/results/
+**/ckpts/
+**/checkpoints/
+**/logs/
 
 # Local CUDA/PyTorch build and wheel artifacts
 methods/**/.cuda-*/
 methods/**/wheels*/
 *.whl
 build/
+**/build/
 dist/
 *.egg-info/
+**/*.egg-info/
+*.so
+*.o
+*.a
+*.d
+*.ptx
+*.cubin
+*.fatbin
+*.cu.o
+*.cuda.o
+compile_commands.json
 
 # Model checkpoints and training logs
 *.pth
 *.pt
 *.ckpt
 events.out.tfevents.*
+*.log
 
 # Dataset-local experiment outputs
 src/datasets/**/experiments/
+
+# Local media/data artifacts
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.ply
