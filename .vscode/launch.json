@@ -1,0 +1,23 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug leo_3dgs_trainer",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/methods/external/gsplat/examples/leo_3dgs_trainer.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "python": "/home/leo/miniconda3/envs/gsplat310/bin/python",
+      "args": [
+        "default",
+        "--data-dir", "/home/leo/Projects/SJTU/src/datasets/saltpond",
+        "--result-dir", "./results/saltpond",
+        "--data-factor", "1",
+        "--batch-size", "1",
+        "--depth-loss",
+        "--disable-viewer"
+        ]
+    }
+  ]
+}

@@ -1,4 +1,4 @@
-# gsplat编译需要的环境
+# gsplat编译需要的环境 ddd
 
 ## gsplat pip install gsplat 的包
 
@@ -71,8 +71,9 @@ export CUDAHOSTCXX="$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-c++"
 
 export BUILD_3DGUT=0
 export BUILD_2DGS=0
-export NUM_CHANNELS=3
-export MAX_JOBS=2
+export NUM_CHANNELS=3,4
+# 这个可以不设置
+# export MAX_JOBS=2
 
 cd /home/leo/Projects/SJTU/methods/external/gsplat/examples
 
@@ -87,6 +88,58 @@ python simple_trainer.py default \
   --save_steps 7000 10000 15000 30000
 ```
 
+### 把环境变量做出conda激活自动加载
+
+```Shell
+mkdir -p "$CONDA_PREFIX/etc/conda/activate.d"
+
+code "$CONDA_PREFIX/etc/conda/activate.d/gsplat_cuda.sh"
+```
+
+写进去
+
+```
+export CUDA_HOME="$CONDA_PREFIX"
+export CUDA_INC="$CONDA_PREFIX/targets/x86_64-linux/include"
+export CUDA_LIB="$CONDA_PREFIX/targets/x86_64-linux/lib"
+export NVIDIA_CU13="$CONDA_PREFIX/lib/python3.10/site-packages/nvidia/cu13"
+
+export PATH="$CUDA_HOME/bin:$PATH"
+export CPATH="$CUDA_INC:$NVIDIA_CU13/include:$CPATH"
+export LIBRARY_PATH="$CUDA_LIB:$NVIDIA_CU13/lib:$LIBRARY_PATH"
+export LD_LIBRARY_PATH="$CUDA_LIB:$NVIDIA_CU13/lib:$LD_LIBRARY_PATH"
+export TORCH_CUDA_ARCH_LIST="12.0"
+
+export CC="$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-cc"
+export CXX="$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-c++"
+export CUDAHOSTCXX="$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-c++"
+
+export BUILD_3DGUT=0
+export BUILD_2DGS=0
+export NUM_CHANNELS=3,4
+```
+
+然后重新开终端：
+
+```bash
+conda activate gsplat310
+echo $BUILD_2DGS $BUILD_3DGUT $NUM_CHANNELS
+```
+
+> 应该输出：
+> 0 0 3
+
+### 单独构建编译
+
+如果你之前有 build 缓存，可能还要清一下：
+
+```bash
+cd /home/leo/Projects/SJTU/methods/external/gsplat
+rm -rf build
+rm -rf ~/.cache/torch_extensions/py310_cu*
+/home/leo/miniconda3/envs/gsplat310/bin/python -m pip install -e . --no-build-isolation --no-deps
+```
+
 ### 评估
 
 ```bash
@@ -98,6 +151,9 @@ python simple_trainer.py default \
   --disable_video \
   --ckpt ./results/curasao/ckpts/ckpt_9999_rank0.pt
 ```
+
+
+
 
 # seasplat 编译cuda
 
@@ -204,15 +260,59 @@ python train.py \
 watch -n 1 nvidia-smi
 ```
 
-# conda 创建、删除、退出、查看、冻结和解冻环境
+---
 
-## 创建
+# Conda
+
+## Conda配置国内镜像
+
+1. 直接执行
+
+```bash
+conda config --set show_channel_urls yes
+```
+
+2. 然后打开配置文件：
+
+```bash
+nano ~/.condarc
+```
+
+3. 把内容改成这样：
+
+```text
+channels:
+  - defaults
+
+show_channel_urls: true
+
+default_channels:
+  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main
+  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/r
+  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/msys2
+
+custom_channels:
+  conda-forge: https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud
+  pytorch: https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud
+```
+
+4. 保存后清缓存：
+
+```bash
+conda clean -i
+```
+
+
+
+## conda 创建、删除、退出、查看、冻结和解冻环境
+
+### 创建
 
 ```bash
 conda create -n <环境名> python=3.10 -y
 ```
 
-## 删除
+### 删除
 
 ```bash
 #先退出
@@ -222,19 +322,19 @@ conda deactivate
 conda env remove -n <环境名>
 ```
 
-## 退出
+### 退出
 
 ```bash
 conda deactivate
 ```
 
-## 查看
+### 查看
 
 ```bash
 conda env list
 ```
 
-## 冻结和解冻环境
+### 冻结和解冻环境
 
 ```bash
 #先激活要冻结的环境
@@ -252,6 +352,8 @@ rm "$CONDA_PREFIX/conda-meta/frozen"
 # 确认+ 消失就解冻了。：
 conda env list
 ```
+
+---
 
 # 生成无畸变图片
 
@@ -298,4 +400,54 @@ for scene in "${scenes[@]}"; do
        "${ROOT}/${scene}/undistorted_pinhole/sparse/0/"
   fi
 done
+```
+
+
+# Ubuntu
+
+## Ubuntu设置国内镜像
+
+1. 先查看源
+
+```bash
+grep -R "archive.ubuntu.com\|security.ubuntu.com" /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null
+```
+
+2. 找到修改镜像的文件
+
+```bash
+ls /etc/apt/sources.list.d
+```
+
+3. 打开要修改的文件
+
+```bash
+sudo nano /etc/apt/sources.list.d/ubuntu.sources
+```
+
+4. 修改镜像
+
+`URIs: http://archive.ubuntu.com/ubuntu/`   $\to$ `URIs: https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ `
+
+如果还有：`URIs: http://security.ubuntu.com/ubuntu/` $\to$  `URIs: https://mirrors.tuna.tsinghua.edu.cn/ubuntu/`
+
+
+
+---
+
+# Pip
+
+## 配置pip国内镜像
+
+1. 执行
+
+```bash
+python -m pip install --upgrade pip -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+pip config set global.index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+```
+
+2. 查看当前 pip 配置：
+
+```bash
+pip config list
 ```

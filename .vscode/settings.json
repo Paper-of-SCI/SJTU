@@ -15,5 +15,9 @@
     "python-envs.defaultPackageManager": "ms-python.python:conda",
     
     "python.defaultInterpreterPath": "/home/leo/miniconda3/bin/python",
-    "python.terminal.activateEnvironment": true
+    "python.terminal.activateEnvironment": true,
+    
+
+
+  
 }
