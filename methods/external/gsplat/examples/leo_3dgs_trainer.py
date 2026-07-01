@@ -77,6 +77,9 @@ from nerfview import CameraState, RenderTabState, apply_float_colormap
 
 @dataclass
 class Config:
+    # leo的参数
+    use_underwater_rasterize_formula: bool = False
+    
     # Disable viewer
     # 中文：是否关闭交互式 viewer；服务器/后台训练时一般设为 True。
     disable_viewer: bool = False
@@ -715,6 +718,26 @@ class Runner:
 
         # Track if Gaussians are frozen (for controller distillation)
         self._gaussians_frozen = False
+        
+        # 水下物理参数
+        self.direct_attenuation_coeffs = torch.nn.Parameter(
+            torch.zeros(3, device=self.device)
+        )
+        self.back_scatter_coeffs = torch.nn.Parameter(
+            torch.zeros(3, device=self.device)
+        )
+        self.veiling_light_rgb = torch.nn.Parameter(torch.zeros(3, device=self.device))
+        self.underwater_physical_optimizers = [
+        torch.optim.Adam(
+                [
+                    self.direct_attenuation_coeffs,
+                    self.back_scatter_coeffs,
+                    self.veiling_light_rgb,
+                ],
+                lr=1e-3 * math.sqrt(cfg.batch_size),
+            )
+        ]
+        
 
     def freeze_gaussians(self):
         """Freeze all Gaussian parameters for controller distillation.
@@ -875,7 +898,31 @@ class Runner:
                 torch.cat([rgb, extra], dim=-1) if extra is not None else rgb
             )
 
+        # 下面是写 含有衰减的物理公式
+        if cfg.use_underwater_rasterize_formula and cfg.depth_loss:
+            render_colors = self.rasterize_physical_formula(render_colors)
+        
         return render_colors, render_alphas, info
+    
+    def rasterize_physical_formula(self, render_colors_and_depths:Tensor):
+        pure_colors_images = render_colors_and_depths[:,:,:,:3]
+        pure_depth_images = render_colors_and_depths[:,:,:,3:4]
+        
+        beta_d = self.direct_attenuation_coeffs.view(1, 1, 1, 3)
+        transmission = torch.exp(-beta_d * pure_depth_images)
+        
+        beta_b = self.back_scatter_coeffs.view(1, 1, 1, 3)
+        b_inf = self.veiling_light_rgb.view(1, 1, 1, 3)
+        backscatter = b_inf * (1.0 - torch.exp(-beta_b * pure_depth_images))
+        
+        colors_images_physical = pure_colors_images*transmission + backscatter
+        
+        colors_images_physical_and_depth = torch.cat(
+            [colors_images_physical, pure_depth_images],
+            dim=-1,
+        )
+        
+        return colors_images_physical_and_depth
 
     def train(self):
         cfg = self.cfg
@@ -1317,10 +1364,14 @@ class Runner:
                 frame_idcs=None,  # For novel views, pass None (no per-frame parameters available)
                 camera_idcs=data["camera_idx"].to(device),
                 exposure=exposure,
-            )  # [1, H, W, 3]
+                render_mode="RGB+ED" if cfg.use_underwater_rasterize_formula else "RGB",
+            )  # [1, H, W, 4]
             torch.cuda.synchronize()
             ellipse_time += max(time.time() - tic, 1e-10)
 
+            
+            if colors.shape[-1] > 3:
+                colors = colors[..., :3]
             colors = torch.clamp(colors, 0.0, 1.0)
             canvas_list = [pixels, colors]
 
