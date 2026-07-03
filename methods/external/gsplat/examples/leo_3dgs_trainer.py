@@ -77,8 +77,13 @@ from nerfview import CameraState, RenderTabState, apply_float_colormap
 
 @dataclass
 class Config:
-    # leo的参数
+    '''
+    leo的参数
+    '''
+    # true则是启用物理渲染公式
     use_underwater_rasterize_formula: bool = False
+    # depth_loss启用只是为了获得深度图，因为depth_loss必须和use_underwater_rasterize_formula一起使用。use_depth_loss为true才会启用深度loss训练。
+    use_depth_loss: bool = False
     
     # Disable viewer
     # 中文：是否关闭交互式 viewer；服务器/后台训练时一般设为 True。
@@ -1108,7 +1113,8 @@ class Runner:
                 depthloss = depth_l1_loss(
                     depths, depths_gt, scene_scale=self.scene_scale
                 )
-                loss += depthloss * cfg.depth_lambda
+                if cfg.use_depth_loss:
+                    loss += depthloss * cfg.depth_lambda
             if cfg.post_processing == "bilateral_grid":
                 post_processing_reg_loss = 10 * total_variation_loss(
                     self.post_processing_module.grids

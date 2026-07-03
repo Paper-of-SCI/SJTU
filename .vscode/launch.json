@@ -16,7 +16,8 @@
         "--data-factor", "1",
         "--batch-size", "1",
         "--depth-loss",
-        "--disable-viewer"
+        "--disable-viewer",
+        "--use_underwater_rasterize_formula"
         ]
     }
   ]

@@ -77,15 +77,17 @@ export NUM_CHANNELS=3,4
 
 cd /home/leo/Projects/SJTU/methods/external/gsplat/examples
 
-python simple_trainer.py default \
-  --data_dir /home/leo/Projects/SJTU/src/datasets/saltpond \
+python leo_3dgs_trainer.py default \
+  --data_dir /home/leo/Projects/SJTU/src/datasets/SeathruNeRF_dataset/JapaneseGradens-RedSea/undistorted_pinhole \
   --data_factor 1 \
-  --result_dir ./results/saltpond \
+  --result_dir ./results/JapaneseGradens-RedSea-underwaterRasterizeFormula \
   --disable_viewer \
   --disable_video \
   --batch_size 1 \
-  --eval_steps 1000 2000 3000 4000 5000 6000 7000 8000 9000 10000 11000 12000 13000 14000 15000 16000 17000 18000 19000 20000 21000 22000 23000 24000 25000 26000 27000 28000 29000 30000 \
-  --save_steps 7000 10000 15000 30000
+  --eval_steps 1000 22000 29000 30000 \
+  --save_steps 15000 30000 \
+  --use_underwater_rasterize_formula \
+  --depth-loss
 ```
 
 ### 把环境变量做出conda激活自动加载
