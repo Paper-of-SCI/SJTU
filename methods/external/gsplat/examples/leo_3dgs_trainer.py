@@ -74,6 +74,13 @@ from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
 
+from leoUtils.gae_utils import build_gaussian_attributes
+from neuroNetWork.local_knn import build_local_feature_groups
+from neuroNetWork.local_knn import build_local_knn_indices, gather_local_features
+from neuroNetWork.local_gs_context_attention import LocalGaussianContextAttention
+from neuroNetWork.gaussian_attribute_encoder import GaussianAttributeEncoder
+from neuroNetWork.contextual_gaussian_parameter_decoder import ContextualGaussianParameterDecoder
+
 
 @dataclass
 class Config:
@@ -84,6 +91,11 @@ class Config:
     use_underwater_rasterize_formula: bool = False
     # depth_loss启用只是为了获得深度图，因为depth_loss必须和use_underwater_rasterize_formula一起使用。use_depth_loss为true才会启用深度loss训练。
     use_depth_loss: bool = False
+    # 使用GAE MLP
+    use_gae_encoder: bool = False
+    # gae_encoder_activation_num_steps
+    gae_encoder_activation_num_steps: int = 25000
+    
     
     # Disable viewer
     # 中文：是否关闭交互式 viewer；服务器/后台训练时一般设为 True。
@@ -724,7 +736,11 @@ class Runner:
         # Track if Gaussians are frozen (for controller distillation)
         self._gaussians_frozen = False
         
-        # 水下物理参数
+        '''
+        LEO      
+        水下物理参数
+        '''
+  
         self.direct_attenuation_coeffs = torch.nn.Parameter(
             torch.zeros(3, device=self.device)
         )
@@ -742,6 +758,51 @@ class Runner:
                 lr=1e-3 * math.sqrt(cfg.batch_size),
             )
         ]
+        
+        '''
+        LEO
+        MLP
+        '''
+        self.gae_encoder = GaussianAttributeEncoder(
+            input_dim=83,
+            feature_dim=16,
+            hidden_dim=32,
+            num_layers=3,
+            normalize_output=True,
+        ).to(self.device)
+        
+        self.gae_optimizer = torch.optim.Adam(
+            self.gae_encoder.parameters(),
+            lr=5e-4,
+        )
+        
+        self.lgca_attention = LocalGaussianContextAttention(
+            feature_dim=16,
+            num_heads=4,
+            ffn_mult=2,
+        ).to(self.device)
+        
+        self.lgca_optimizer = torch.optim.Adam(
+            self.lgca_attention.parameters(),
+            lr=5e-4,
+        )
+        
+        self.cgpd_decoder = ContextualGaussianParameterDecoder(
+            feature_dim=16,
+            hidden_dim=32,
+            num_layers=3,
+            sh_degree=3,
+            color_channels=3,
+            delta_scale=1.0,
+        ).to(self.device)
+        
+        self.cgpd_optimizer = torch.optim.Adam(
+            self.cgpd_decoder.parameters(),
+            lr=5e-5,
+        )
+        
+        self.lgca_knn_indices = None
+        
         
 
     def freeze_gaussians(self):
@@ -775,12 +836,65 @@ class Runner:
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
         splats = splats if splats is not None else self.splats
-        means = splats["means"]  # [N, 3]
-        # quats = F.normalize(splats["quats"], dim=-1)  # [N, 4]
-        # rasterization does normalization internally
-        quats = splats["quats"]  # [N, 4]
-        scales = torch.exp(splats["scales"])  # [N, 3]
-        opacities = torch.sigmoid(splats["opacities"])  # [N,]
+        
+        '''
+        构建每个 Gaussian 的 GAE 输入属性: [N, 83]
+        '''
+        if self.cfg.use_gae_encoder:
+            gaussian_attributes = build_gaussian_attributes(
+                splats,
+                scene_scale=self.scene_scale,
+                pos_freqs=4,
+            )
+            
+            gae_features = self.gae_encoder(gaussian_attributes)
+            
+            # KNN找取最近的16个邻居，构建局部特征组
+            if (
+                self.lgca_knn_indices is None
+                or self.lgca_knn_indices.shape[0] != splats["means"].shape[0]
+            ):
+                self.lgca_knn_indices = build_local_knn_indices(
+                    points=splats["means"],
+                    k=8,
+                    chunk_size=2048,
+                    include_self=False,
+                )
+            local_features = gather_local_features(
+                features=gae_features,
+                knn_indices=self.lgca_knn_indices,
+            )
+            
+            
+            # [N, 16, 32]
+
+            context_features = self.lgca_attention(
+                features=gae_features,
+                local_features=local_features,
+            )  # [N, 32]
+            
+            splats_deltas = self.cgpd_decoder(context_features)
+            
+            means = splats["means"] + splats_deltas["means"]
+            quats = splats["quats"] + splats_deltas["quats"]
+            scales = torch.exp(splats["scales"] + splats_deltas["scales"])
+            opacities = torch.sigmoid(splats["opacities"] + splats_deltas["opacities"])
+
+            sh0 = splats["sh0"] + splats_deltas["sh0"]
+            shN = splats["shN"] + splats_deltas["shN"]
+        
+        else:
+            means = splats["means"]  # [N, 3]
+            # quats = F.normalize(splats["quats"], dim=-1)  # [N, 4]
+            # rasterization does normalization internally
+            quats = splats["quats"]  # [N, 4]
+            scales = torch.exp(splats["scales"])  # [N, 3]
+            opacities = torch.sigmoid(splats["opacities"])  # [N,]
+
+            sh0 = splats["sh0"]
+            shN = splats["shN"]
+        
+
 
         image_ids = kwargs.pop("image_ids", None)
         if self.cfg.app_opt:
@@ -795,11 +909,24 @@ class Runner:
         else:
             # Cast before the cat so both the cat and the SH kernel run on fp16.
             if self.cfg.sh_fp16:
-                colors = torch.cat(
-                    [splats["sh0"].half(), splats["shN"].half()], 1
-                )  # [N, K, 3]
+                colors = torch.cat([sh0.half(), shN.half()], 1)
+                # colors = torch.cat(
+                #     [splats["sh0"].half(), splats["shN"].half()], 1
+                # )  # [N, K, 3]
             else:
-                colors = torch.cat([splats["sh0"], splats["shN"]], 1)  # [N, K, 3]
+                colors = torch.cat([sh0, shN], 1)
+                # colors = torch.cat([splats["sh0"], splats["shN"]], 1)  # [N, K, 3]
+                
+        
+            
+                    
+            
+            
+            
+            
+            
+        
+        
 
         if rasterize_mode is None:
             rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
@@ -995,6 +1122,18 @@ class Runner:
         global_tic = time.time()
         pbar = tqdm.tqdm(range(init_step, max_steps))
         for step in pbar:
+            self.cfg.use_gae_encoder = True if step >= cfg.gae_encoder_activation_num_steps else False
+            
+            if self.cfg.use_gae_encoder:
+                self.freeze_gaussians()
+                
+                
+                
+                
+                
+                
+                
+            
             if not cfg.disable_viewer:
                 while self.viewer.state == "paused":
                     time.sleep(0.01)
@@ -1040,7 +1179,7 @@ class Runner:
                 camtoworlds = self.pose_adjust(camtoworlds, image_ids)
 
             # sh schedule
-            sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
+            sh_degree_to_use =  min(step // cfg.sh_degree_interval, cfg.sh_degree)
 
             # forward
             renders, alphas, info = self.stage.render(
@@ -1267,12 +1406,29 @@ class Runner:
                     visibility_mask = (info["radii"] > 0).all(-1).any(0)
 
             # optimize
-            for optimizer in self.optimizers.values():
-                if cfg.visible_adam:
-                    optimizer.step(visibility_mask)
-                else:
-                    optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
+            
+            if cfg.use_gae_encoder:
+                self.gae_optimizer.step()
+                self.lgca_optimizer.step()
+                self.cgpd_optimizer.step()
+
+                self.gae_optimizer.zero_grad(set_to_none=True)
+                self.lgca_optimizer.zero_grad(set_to_none=True)
+                self.cgpd_optimizer.zero_grad(set_to_none=True)
+            
+            if not self._gaussians_frozen:
+                for optimizer in self.optimizers.values():
+                    if cfg.visible_adam:
+                        optimizer.step(visibility_mask)
+                    else:
+                        optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+            else:
+                for optimizer in self.optimizers.values():
+                    optimizer.zero_grad(set_to_none=True)
+                    
+                    
+                    
             for optimizer in self.pose_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)

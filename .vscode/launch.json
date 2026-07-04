@@ -11,13 +11,15 @@
       "python": "/home/leo/miniconda3/envs/gsplat310/bin/python",
       "args": [
         "default",
-        "--data-dir", "/home/leo/Projects/SJTU/src/datasets/saltpond",
-        "--result-dir", "./results/saltpond",
-        "--data-factor", "1",
+        "--data-dir", "/home/leo/Projects/SJTU/src/datasets/SeathruNeRF_dataset/JapaneseGradens-RedSea/undistorted_pinhole",
+        "--result-dir", "./results/JapaneseGradens-RedSea-underwaterRasterizeFormula",
+        "--data-factor", "2",
         "--batch-size", "1",
-        "--depth-loss",
         "--disable-viewer",
-        "--use_underwater_rasterize_formula"
+        "--disable_video",
+        "--use_underwater_rasterize_formula",
+        "--depth-loss",
+        "--use_depth_loss"
         ]
     }
   ]

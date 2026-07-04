@@ -9,3 +9,10 @@ python downsample_images.py \
   --factor 2
 ```
 
+
+```Shell
+python downsample_images.py \
+  --input /home/leo/Projects/SJTU/src/datasets/saltpond/images \
+  --output /home/leo/Projects/SJTU/src/datasets/saltpond/images_2 \
+  --factor 2
+```
